@@ -1,0 +1,11 @@
+yt-dlp
+faster-whisper
+edge-tts
+openai
+pydub
+ffmpeg-python
+python-dotenv
+google-generativeai
+opencv-python
+Pillow
+
