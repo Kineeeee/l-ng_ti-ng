@@ -9,3 +9,9 @@ google-generativeai
 opencv-python
 Pillow
 
+# Pitch processing
+librosa
+soundfile
+pyworld
+praat-parselmouth
+

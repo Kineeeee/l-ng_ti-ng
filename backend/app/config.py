@@ -49,6 +49,12 @@ ORIGINAL_VOLUME_DB = float(os.getenv("ORIGINAL_VOLUME_DB", "0.0"))
 TTS_VOLUME_DB = float(os.getenv("TTS_VOLUME_DB", "2.0"))
 AUDIO_SYNC_OFFSET_MS = float(os.getenv("AUDIO_SYNC_OFFSET_MS", "0.0"))
 
+# Pitch Processing settings
+# method: "none" | "shift" (Phương án 1) | "clone" (Phương án 2)
+PITCH_METHOD = os.getenv("PITCH_METHOD", "none")
+PITCH_MAX_SHIFT_SEMITONES = float(os.getenv("PITCH_MAX_SHIFT_SEMITONES", "6.0"))
+PITCH_F0_BLEND_RATIO = float(os.getenv("PITCH_F0_BLEND_RATIO", "0.7"))
+
 
 
 

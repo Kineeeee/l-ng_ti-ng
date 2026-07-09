@@ -28,12 +28,16 @@ from backend.app.config import (
     DUCK_VOLUME_DB,
     ORIGINAL_VOLUME_DB,
     TTS_VOLUME_DB,
-    AUDIO_SYNC_OFFSET_MS
+    AUDIO_SYNC_OFFSET_MS,
+    PITCH_METHOD,
+    PITCH_MAX_SHIFT_SEMITONES,
+    PITCH_F0_BLEND_RATIO,
 )
 from backend.app.pipeline.download import download_video
 from backend.app.pipeline.transcribe import transcribe_audio
 from backend.app.pipeline.translate import translate_segments
 from backend.app.pipeline.tts import generate_tts_for_segments
+from backend.app.pipeline.pitch import apply_pitch_to_all_segments
 from backend.app.pipeline.align import align_and_merge_audio
 from backend.app.pipeline.subtitle import generate_subtitles
 from backend.app.pipeline.render import render_final_video
@@ -92,6 +96,15 @@ def main():
     parser.add_argument("--original-vol", type=float, default=ORIGINAL_VOLUME_DB, help="Overall volume adjustment of original audio in dB (default: 0.0)")
     parser.add_argument("--tts-vol", type=float, default=TTS_VOLUME_DB, help="Volume boost of dubbed TTS voice in dB (default: 2.0)")
     parser.add_argument("--sync-offset", type=float, default=AUDIO_SYNC_OFFSET_MS, help="Global audio sync offset in milliseconds (default: 0.0)")
+
+    # Pitch processing arguments
+    parser.add_argument("--pitch", default=PITCH_METHOD,
+                        choices=["none", "shift", "clone"],
+                        help="Pitch method: 'none'=tắt | 'shift'=Ph.1 đơn giản | 'clone'=Ph.2 F0 contour (default: none)")
+    parser.add_argument("--pitch-max-shift", type=float, default=PITCH_MAX_SHIFT_SEMITONES,
+                        help="Giới hạn shift semitones cho method=shift (default: 6.0)")
+    parser.add_argument("--pitch-blend", type=float, default=PITCH_F0_BLEND_RATIO,
+                        help="Tỷ lệ blend F0 cho method=clone, 0.0-1.0 (default: 0.7)")
     
     args = parser.parse_args()
     
@@ -143,6 +156,21 @@ def main():
     job_output_dir = os.path.join(output_dir, job_id)
     segments = generate_tts_for_segments(segments, job_output_dir)
     timings["4_TTS"] = time.time() - t0
+
+    # 4.5. Pitch Processing (optional)
+    if args.pitch != "none":
+        print(f"\n--- [Step 4.5] Pitch Processing ({args.pitch}) ---")
+        t0 = time.time()
+        segments = apply_pitch_to_all_segments(
+            segments=segments,
+            orig_audio_path=audio_path,
+            method=args.pitch,
+            max_shift_semitones=args.pitch_max_shift,
+            f0_blend_ratio=args.pitch_blend,
+        )
+        timings["4.5_Pitch"] = time.time() - t0
+    else:
+        print("\n--- [Step 4.5] Pitch Processing (tắt) ---")
     
     # 5. Align & Merge Audio
     print("\n--- [Step 5] Align Audio ---")
