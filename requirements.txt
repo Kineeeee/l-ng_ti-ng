@@ -2,6 +2,13 @@ yt-dlp
 faster-whisper
 edge-tts
 openai
+requests
+
+# --- Transcribe acceleration (optional) ---
+# Apple Silicon GPU backend (M1/M2/M3) — install to enable WHISPER_DEVICE=mlx
+mlx-whisper
+# Groq cloud API backend — install to enable WHISPER_DEVICE=groq
+groq
 pydub
 ffmpeg-python
 python-dotenv

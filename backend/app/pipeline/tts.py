@@ -3,11 +3,19 @@ import re
 import asyncio
 import time
 import wave
+import hashlib
 import edge_tts
 from pydub import AudioSegment
 from backend.app.config import (
     TTS_ENGINE, TTS_VOICE, TTS_CONCURRENCY, TTS_SPEED,
-    GEMINI_API_KEY, GEMINI_TTS_MODEL
+    GEMINI_API_KEY, GEMINI_TTS_MODEL,
+    ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL, ELEVENLABS_CONCURRENCY
+)
+from backend.app.pipeline.audio_utils import (
+    get_wav_duration_fast as _get_wav_duration_fast,
+    is_valid_wav as _is_valid_wav,
+    trim_silence as _trim_silence,
+    create_silence_wav as _create_silence_wav,
 )
 
 # --- Constants ---
@@ -19,13 +27,53 @@ def _sanitize_text(text: str) -> str:
     """Clean up text before sending to edge-tts."""
     if not text:
         return ""
-    # Remove characters that edge-tts can't pronounce
-    cleaned = re.sub(r'[^\w\s.,!?;:\-–—\'\"()…\u00C0-\u024F\u1E00-\u1EFF\u0300-\u036F]', ' ', text)
+    # Remove characters that edge-tts can't pronounce, but keep % for percentage
+    cleaned = re.sub(r'[^\w\s.,!?;:\-–—\'\"()…%\u00C0-\u024F\u1E00-\u1EFF\u0300-\u036F]', ' ', text)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    # If only numbers/punctuation remain → not speakable
-    if cleaned and not re.search(r'[a-zA-Z\u00C0-\u024F\u1E00-\u1EFF\u0400-\u04FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]', cleaned):
+    # If only punctuation remain → not speakable (numbers are speakable)
+    if cleaned and not re.search(r'[a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF\u0400-\u04FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]', cleaned):
         return ""
     return cleaned
+
+
+def _sanitize_text_elevenlabs(text: str) -> str:
+    """Clean up text before sending to ElevenLabs, preserving audio tags like [laughs], [sighs]."""
+    if not text:
+        return ""
+    # Pattern to match ElevenLabs audio tags: [word] or [multi word]
+    tag_pattern = re.compile(r'\[([a-zA-Z][a-zA-Z\s]*?)\]')
+
+    result_parts = []
+    pos = 0
+    for match in tag_pattern.finditer(text):
+        # Sanitize text before this tag
+        before = text[pos:match.start()]
+        if before:
+            cleaned_before = re.sub(r'[^\w\s.,!?;:\-–—\'\"()…%\u00C0-\u024F\u1E00-\u1EFF\u0300-\u036F]', ' ', before)
+            cleaned_before = re.sub(r'\s+', ' ', cleaned_before).strip()
+            if cleaned_before:
+                result_parts.append(cleaned_before)
+        # Preserve the audio tag as-is
+        result_parts.append(match.group(0))
+        pos = match.end()
+
+    # Remaining text after last tag
+    remaining = text[pos:]
+    if remaining:
+        cleaned_remaining = re.sub(r'[^\w\s.,!?;:\-–—\'\"()…%\u00C0-\u024F\u1E00-\u1EFF\u0300-\u036F]', ' ', remaining)
+        cleaned_remaining = re.sub(r'\s+', ' ', cleaned_remaining).strip()
+        if cleaned_remaining:
+            result_parts.append(cleaned_remaining)
+
+    result = ' '.join(result_parts)
+    result = re.sub(r'\s+', ' ', result).strip()
+    # Speakability check (tags alone are still okay for ElevenLabs)
+    if result and not tag_pattern.search(result) and not re.search(
+        r'[a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF\u0400-\u04FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]',
+        result
+    ):
+        return ""
+    return result
 
 
 def _has_vietnamese_chars(text: str) -> bool:
@@ -38,67 +86,6 @@ def _has_vietnamese_chars(text: str) -> bool:
     return bool(vn_pattern.search(text))
 
 
-def _detect_leading_silence(sound: AudioSegment, silence_threshold: float = -50.0, chunk_size: int = 10) -> int:
-    """Detect leading silence in milliseconds."""
-    trim_ms = 0
-    duration = len(sound)
-    while trim_ms < duration and sound[trim_ms:trim_ms+chunk_size].dBFS < silence_threshold:
-        trim_ms += chunk_size
-    return trim_ms
-
-
-def _trim_silence(sound: AudioSegment, silence_threshold: float = -50.0, chunk_size: int = 10, keep_silence_ms: int = 30) -> AudioSegment:
-    """Trim leading and trailing silence from an AudioSegment with a cushion."""
-    duration = len(sound)
-    start_trim = _detect_leading_silence(sound, silence_threshold, chunk_size)
-    
-    # Reverse to detect trailing silence
-    reversed_sound = sound.reverse()
-    end_trim = _detect_leading_silence(reversed_sound, silence_threshold, chunk_size)
-    
-    trimmed_start = max(0, start_trim - keep_silence_ms)
-    trimmed_end = min(duration, (duration - end_trim) + keep_silence_ms)
-    
-    if trimmed_start >= trimmed_end:
-        return AudioSegment.silent(duration=100, frame_rate=sound.frame_rate).set_channels(sound.channels)
-        
-    return sound[trimmed_start:trimmed_end]
-
-
-def _create_silence_wav(output_path: str, duration_sec: float = 0.5):
-    """Create a short silence WAV file as fallback."""
-    silence = AudioSegment.silent(duration=int(duration_sec * 1000), frame_rate=24000)
-    silence = silence.set_frame_rate(24000).set_channels(1)
-    silence.export(output_path, format="wav")
-
-
-
-def _get_wav_duration_fast(wav_path: str) -> float:
-    """
-    Get WAV duration using wave module (header-only, ~10x faster than pydub).
-    """
-    try:
-        with wave.open(wav_path, 'rb') as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            if rate > 0:
-                return frames / rate
-    except Exception:
-        pass
-    return 0.5
-
-
-def _is_valid_wav(wav_path: str, min_size: int = 100) -> bool:
-    """Check if a WAV file exists and is valid."""
-    if not os.path.exists(wav_path):
-        return False
-    if os.path.getsize(wav_path) <= min_size:
-        return False
-    try:
-        with wave.open(wav_path, 'rb') as wf:
-            return wf.getnframes() > 0
-    except Exception:
-        return False
 
 
 async def _generate_single_tts(text: str, voice: str, output_path: str, segment_id: int,
@@ -267,13 +254,106 @@ async def _generate_single_gemini_tts(text: str, voice: str, output_path: str, s
         return {"success": False, "segment_id": segment_id, "duration": 0.5}
 
 
-async def _generate_tts_all_segments(segments: list, output_dir: str, voice: str):
+def _generate_elevenlabs_tts_bytes(text: str, voice_id: str, model_id: str) -> bytes:
+    """Synchronous HTTP call to ElevenLabs API to generate TTS audio bytes (MP3)."""
+    import requests
+
+    if not ELEVENLABS_API_KEY:
+        raise ValueError("ELEVENLABS_API_KEY is not configured in .env")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+        "xi-api-key": ELEVENLABS_API_KEY,
+    }
+    payload = {
+        "text": text,
+        "model_id": model_id,
+        "voice_settings": {
+            "stability": 0.45,          # Lower = more expressive/emotional
+            "similarity_boost": 0.75,
+            "style": 0.5,               # Style exaggeration (0-1)
+            "use_speaker_boost": True
+        }
+    }
+    response = requests.post(url, json=payload, headers=headers, timeout=60)
+    if response.status_code == 401:
+        raise ValueError("ElevenLabs API key không hợp lệ hoặc hết hạn.")
+    if response.status_code == 422:
+        raise ValueError(f"ElevenLabs từ chối yêu cầu (422): {response.text[:200]}")
+    response.raise_for_status()
+    return response.content
+
+
+async def _generate_single_elevenlabs_tts(text: str, output_path: str, segment_id: int,
+                                           semaphore: asyncio.Semaphore, voice_id: str) -> dict:
+    """
+    Generate TTS for a single segment using ElevenLabs API with retry logic.
+    Supports emotional audio tags: [laughs], [sighs], [whispers], [excited], etc.
+    Returns dict with {success: bool, segment_id: int, duration: float}.
+    """
+    async with semaphore:
+        await asyncio.sleep(0.3)  # Gentle pacing to avoid rate limits
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                mp3_bytes = await asyncio.to_thread(
+                    _generate_elevenlabs_tts_bytes, text, voice_id, ELEVENLABS_MODEL
+                )
+
+                tmp_mp3 = output_path.replace(".wav", ".tmp.mp3")
+                with open(tmp_mp3, "wb") as f:
+                    f.write(mp3_bytes)
+
+                if os.path.exists(tmp_mp3) and os.path.getsize(tmp_mp3) > 100:
+                    audio = AudioSegment.from_file(tmp_mp3, format="mp3")
+                    audio = audio.set_frame_rate(24000).set_channels(1)
+                    trimmed_audio = _trim_silence(audio)
+                    trimmed_audio.export(output_path, format="wav")
+
+                    try:
+                        os.remove(tmp_mp3)
+                    except OSError:
+                        pass
+
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 100:
+                        duration = _get_wav_duration_fast(output_path)
+                        return {"success": True, "segment_id": segment_id, "duration": duration}
+                    else:
+                        raise ValueError("WAV file created but is invalid or empty")
+                else:
+                    raise ValueError("ElevenLabs trả về response rỗng")
+
+            except Exception as e:
+                tmp_mp3 = output_path.replace(".wav", ".tmp.mp3")
+                if os.path.exists(tmp_mp3):
+                    try:
+                        os.remove(tmp_mp3)
+                    except OSError:
+                        pass
+
+                backoff = RETRY_DELAY * (2 ** attempt)
+                if attempt < MAX_RETRIES - 1:
+                    print(f"[Module 4]   ⟳ Segment {segment_id} ElevenLabs attempt {attempt + 1}/{MAX_RETRIES} failed, retrying in {backoff:.1f}s... (Error: {e})")
+                    await asyncio.sleep(backoff)
+                else:
+                    print(f"[Module 4]   ✗ Segment {segment_id} ElevenLabs failed after {MAX_RETRIES} retries: {e}")
+
+        return {"success": False, "segment_id": segment_id, "duration": 0.5}
+
+
+async def _generate_tts_all_segments(segments: list, output_dir: str, engine: str, voice: str):
 
     """
     Generate TTS for all segments with concurrency control.
     Uses asyncio.gather to preserve correct ordering (fixes as_completed bug).
     """
-    semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
+    # Use separate concurrency limit for ElevenLabs (free tier is sensitive to bursts)
+    if engine == "elevenlabs":
+        semaphore = asyncio.Semaphore(ELEVENLABS_CONCURRENCY)
+    else:
+        semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
 
     success_count = 0
     skip_count = 0
@@ -288,7 +368,11 @@ async def _generate_tts_all_segments(segments: list, output_dir: str, voice: str
 
     for idx, segment in enumerate(segments):
         raw_text = segment.get("translated_text", "").strip()
-        cleaned = _sanitize_text(raw_text)
+        # ElevenLabs uses its own sanitizer to preserve [audio tags]
+        if engine == "elevenlabs":
+            cleaned = _sanitize_text_elevenlabs(raw_text)
+        else:
+            cleaned = _sanitize_text(raw_text)
         wav_path = os.path.join(output_dir, f"tts_{segment['id']}.wav")
 
         if not cleaned:
@@ -299,21 +383,33 @@ async def _generate_tts_all_segments(segments: list, output_dir: str, voice: str
             skip_count += 1
             continue
 
-        # Cache: skip generation if valid WAV already exists
-        if _is_valid_wav(wav_path):
-            duration = _get_wav_duration_fast(wav_path)
-            segment["tts_audio_path"] = wav_path
-            segment["tts_duration"] = duration
-            cache_count += 1
-            continue
+        hash_input = f"{raw_text}|{engine}|{voice}"
+        text_hash = hashlib.md5(hash_input.encode("utf-8")).hexdigest()
+        hash_path = wav_path + ".hash"
+
+        # Cache: skip generation if valid WAV already exists and hash matches
+        if _is_valid_wav(wav_path) and os.path.exists(hash_path):
+            try:
+                with open(hash_path, "r", encoding="utf-8") as f:
+                    saved_hash = f.read().strip()
+                if saved_hash == text_hash:
+                    duration = _get_wav_duration_fast(wav_path)
+                    segment["tts_audio_path"] = wav_path
+                    segment["tts_duration"] = duration
+                    cache_count += 1
+                    continue
+            except Exception:
+                pass
 
         # Language check warning
         if not _has_vietnamese_chars(cleaned) and len(cleaned) > 5:
             lang_warn_count += 1
 
         segment_map[segment["id"]] = segment
-        if TTS_ENGINE == "gemini":
+        if engine == "gemini":
             tasks.append(_generate_single_gemini_tts(cleaned, voice, wav_path, segment["id"], semaphore))
+        elif engine == "elevenlabs":
+            tasks.append(_generate_single_elevenlabs_tts(cleaned, wav_path, segment["id"], semaphore, voice))
         else:
             tasks.append(_generate_single_tts(cleaned, voice, wav_path, segment["id"], semaphore))
 
@@ -328,7 +424,8 @@ async def _generate_tts_all_segments(segments: list, output_dir: str, voice: str
         return
 
     # Run all TTS tasks with asyncio.gather — preserves order!
-    print(f"[Module 4] Processing {len(tasks)} segments (concurrency={TTS_CONCURRENCY})...")
+    _active_concurrency = ELEVENLABS_CONCURRENCY if engine == "elevenlabs" else TTS_CONCURRENCY
+    print(f"[Module 4] Processing {len(tasks)} segments (concurrency={_active_concurrency})...")
     t0 = time.time()
 
     # Use gather instead of as_completed to maintain correct ordering
@@ -348,39 +445,58 @@ async def _generate_tts_all_segments(segments: list, output_dir: str, voice: str
             continue
 
         wav_path = os.path.join(output_dir, f"tts_{seg_id}.wav")
+        hash_path = wav_path + ".hash"
+        
+        raw_text = segment.get("translated_text", "").strip()
+        hash_input = f"{raw_text}|{engine}|{voice}"
+        text_hash = hashlib.md5(hash_input.encode("utf-8")).hexdigest()
 
         if result["success"]:
             segment["tts_audio_path"] = wav_path
             segment["tts_duration"] = result["duration"]
+            try:
+                with open(hash_path, "w", encoding="utf-8") as f:
+                    f.write(text_hash)
+            except Exception:
+                pass
             success_count += 1
         else:
             _create_silence_wav(wav_path, duration_sec=0.5)
             segment["tts_audio_path"] = wav_path
             segment["tts_duration"] = 0.5
+            if os.path.exists(hash_path):
+                try: os.remove(hash_path)
+                except Exception: pass
             fail_count += 1
 
     print(f"[Module 4] Results: {success_count} success, {cache_count} cached, "
           f"{skip_count} skipped, {fail_count} failed | {elapsed:.1f}s")
 
 
-def generate_tts_for_segments(segments: list, output_dir: str, voice: str = TTS_VOICE) -> list:
+def generate_tts_for_segments(segments: list, output_dir: str, engine: str = None, voice: str = None) -> list:
     """
-    Generates TTS audio for each segment's translated_text using edge-tts.
-    Uses per-segment strategy with async concurrency control for reliability.
-    
-    Optimizations vs previous version:
-    - asyncio.gather instead of as_completed (fixes segment mapping bug)
-    - Fast WAV duration reading via wave module (~10x faster)
-    - Cache: skips re-generation if valid WAV exists
-    - Results mapped by segment_id (safe regardless of execution order)
-    
-    Output: updates each segment with 'tts_audio_path' and 'tts_duration'.
+    Generates TTS audio for each segment's translated_text.
+    Supports multiple engines: 'edge-tts' (default), 'gemini', 'elevenlabs'.
+    Uses per-segment async concurrency with caching to avoid re-generation.
+
+    Output: updates each segment in-place with 'tts_audio_path' and 'tts_duration'.
     """
     if not segments:
         return []
 
-    print(f"[Module 4] Generating TTS for {len(segments)} segments using voice '{voice}'...")
-    print(f"[Module 4] Strategy: Per-segment with {TTS_CONCURRENCY} concurrent requests")
+    if engine is None:
+        engine = TTS_ENGINE
+        
+    if not voice:
+        if engine == "elevenlabs":
+            voice = ELEVENLABS_VOICE_ID
+        elif engine == "gemini":
+            voice = "Aoede"
+        else:
+            voice = TTS_VOICE
+
+    print(f"[Module 4] Generating TTS for {len(segments)} segments using engine '{engine}' and voice '{voice}'...")
+    print(f"[Module 4] Strategy: Per-segment with {TTS_CONCURRENCY if engine != 'elevenlabs' else ELEVENLABS_CONCURRENCY} concurrent requests")
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)
 
@@ -395,14 +511,14 @@ def generate_tts_for_segments(segments: list, output_dir: str, voice: str = TTS_
         def _run_in_thread():
             new_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(new_loop)
-            new_loop.run_until_complete(_generate_tts_all_segments(segments, output_dir, voice))
+            new_loop.run_until_complete(_generate_tts_all_segments(segments, output_dir, engine, voice))
             new_loop.close()
 
         t = threading.Thread(target=_run_in_thread)
         t.start()
         t.join()
     else:
-        asyncio.run(_generate_tts_all_segments(segments, output_dir, voice))
+        asyncio.run(_generate_tts_all_segments(segments, output_dir, engine, voice))
 
     elapsed = time.time() - t0
     print(f"[Module 4] TTS generation complete in {elapsed:.1f}s")

@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import re
 import time
@@ -20,9 +21,28 @@ from backend.app.config import (
     TOP_TEXT_BOLD_FONT_PATH
 )
 
+# Cache kết quả kiểm tra HW encoder — tránh gọi ffmpeg -encoders mỗi lần render
+_HW_ENCODER_CACHE: dict = {}
 
 
-import re
+
+def _get_aspect_ratio_profile(width: int, height: int) -> str:
+    """Nhận diện tỷ lệ khưng hình từ kích thước video.
+    
+    Returns:
+        'landscape' — 16:9 kiểu YouTube (width > height)  
+        'portrait'  — 9:16 kiểu TikTok (height > width)
+        'square'    — tỷ lệ gần 1:1
+    """
+    if width == 0 or height == 0:
+        return "landscape"
+    ratio = width / height
+    if ratio > 1.2:
+        return "landscape"
+    elif ratio < 0.85:
+        return "portrait"
+    return "square"
+
 
 def parse_highlight_text(text: str) -> list:
     """Parse text to split segments inside single quotes for highlighting."""
@@ -99,15 +119,11 @@ def _get_video_info(video_path: str) -> dict:
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        import json
         data = json.loads(result.stdout)
         
         info = {"duration": 0, "width": 0, "height": 0, "vcodec": "", "has_audio": False}
-        
-        # Duration from format
         if "format" in data:
             info["duration"] = float(data["format"].get("duration", 0))
-        
         for stream in data.get("streams", []):
             if stream["codec_type"] == "video":
                 info["width"] = int(stream.get("width", 0))
@@ -115,24 +131,36 @@ def _get_video_info(video_path: str) -> dict:
                 info["vcodec"] = stream.get("codec_name", "")
             elif stream["codec_type"] == "audio":
                 info["has_audio"] = True
-        
         return info
     except Exception:
         return {"duration": 0, "width": 0, "height": 0, "vcodec": "", "has_audio": False}
 
 
+
 def _check_hw_encoder_available() -> bool:
-    """Check if h264_videotoolbox is available on this system."""
-    if platform.system() != "Darwin":
-        return False
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            capture_output=True, text=True, timeout=10
-        )
-        return "h264_videotoolbox" in result.stdout
-    except Exception:
-        return False
+    """Check if h264_videotoolbox is available. Result is cached after first call."""
+    if "result" not in _HW_ENCODER_CACHE:
+        if platform.system() != "Darwin":
+            _HW_ENCODER_CACHE["result"] = False
+        else:
+            try:
+                result = subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-encoders"],
+                    capture_output=True, text=True, timeout=10
+                )
+                _HW_ENCODER_CACHE["result"] = "h264_videotoolbox" in result.stdout
+            except Exception:
+                _HW_ENCODER_CACHE["result"] = False
+    return _HW_ENCODER_CACHE["result"]
+
+
+def _find_system_font(candidates: list) -> str | None:
+    """Return the first font path from candidates list that exists on disk."""
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
 
 
 def _run_ffmpeg_with_progress(cmd: list, total_duration: float, label: str = "Rendering"):
@@ -226,8 +254,11 @@ def render_final_video(
     # Probe video info for progress tracking and smart encoding decisions
     video_info = _get_video_info(video_path)
     total_duration = video_info["duration"]
-    print(f"           Source: {video_info['width']}x{video_info['height']}, "
-          f"{video_info['vcodec']}, {total_duration:.1f}s")
+    video_width = video_info.get("width") or 1280
+    video_height = video_info.get("height") or 720
+    ar_profile = _get_aspect_ratio_profile(video_width, video_height)
+    print(f"           Source: {video_width}x{video_height}, "
+          f"{video_info['vcodec']}, {total_duration:.1f}s — {ar_profile}")
     
     # Determine encoder
     hw_available = use_hw_accel and _check_hw_encoder_available()
@@ -245,6 +276,11 @@ def render_final_video(
     needs_video_encode = False
     y_min, y_max = None, None
     
+    # Clamp box ratios: đảm bảo không chiếm quá nhiều diện tích chiều cao
+    # Top box: tối đa 12% chiều cao — Sub box: tối đa 18% chiều cao
+    mask_top_y_ratio = max(0.05, min(0.12, mask_top_y_ratio))
+    mask_sub_y_ratio = max(0.07, min(0.18, mask_sub_y_ratio))
+    
     # Subtitle burn-in (prefer ASS over SRT for better styling)
     subtitle_file = None
     if subtitle_enabled:
@@ -257,8 +293,8 @@ def render_final_video(
     # Search for standard and bold font files supporting unicode (Vietnamese)
     font_file = None
     bold_font_file = None
-    
-    # Check if custom font files are configured and exist
+
+    # Custom font paths from config take priority
     if top_text_font_path:
         abs_font = os.path.abspath(top_text_font_path)
         if os.path.exists(abs_font):
@@ -267,82 +303,68 @@ def render_final_video(
         abs_bold = os.path.abspath(top_text_bold_font_path)
         if os.path.exists(abs_bold):
             bold_font_file = abs_bold
-        
+
+    # Fall back to system fonts per platform
+    _sys = platform.system()
     if not font_file:
-        if platform.system() == "Darwin":
-            possible_fonts = [
+        if _sys == "Darwin":
+            font_file = _find_system_font([
                 "/System/Library/Fonts/Supplemental/Arial.ttf",
                 "/System/Library/Fonts/Helvetica.ttc",
                 "/System/Library/Fonts/HelveticaNeue.ttc",
                 "/System/Library/Fonts/Supplemental/Trebuchet MS.ttf",
                 "/Library/Fonts/Arial.ttf",
-                "/System/Library/Fonts/Arial.ttf"
-            ]
-            for f in possible_fonts:
-                if os.path.exists(f):
-                    font_file = f
-                    break
-        elif platform.system() == "Windows":
-            possible_fonts = [
+            ])
+        elif _sys == "Windows":
+            font_file = _find_system_font([
                 "C:\\Windows\\Fonts\\arial.ttf",
                 "C:\\Windows\\Fonts\\calibri.ttf",
-                "C:\\Windows\\Fonts\\trebuc.ttf"
-            ]
-            for f in possible_fonts:
-                if os.path.exists(f):
-                    font_file = f
-                    break
-        else:  # Linux/other
-            possible_fonts = [
+                "C:\\Windows\\Fonts\\trebuc.ttf",
+            ])
+        else:
+            font_file = _find_system_font([
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                 "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
-            ]
-            for f in possible_fonts:
-                if os.path.exists(f):
-                    font_file = f
-                    break
-                    
+                "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            ])
+
     if not bold_font_file:
-        if platform.system() == "Darwin":
-            possible_bold_fonts = [
+        if _sys == "Darwin":
+            bold_font_file = _find_system_font([
                 "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
                 "/System/Library/Fonts/Supplemental/Arial-Bold.ttf",
                 "/System/Library/Fonts/Supplemental/Trebuchet MS Bold.ttf",
                 "/Library/Fonts/Arial Bold.ttf",
-                "/System/Library/Fonts/Arial Bold.ttf"
-            ]
-            for f in possible_bold_fonts:
-                if os.path.exists(f):
-                    bold_font_file = f
-                    break
-        elif platform.system() == "Windows":
-            possible_bold_fonts = [
+            ])
+        elif _sys == "Windows":
+            bold_font_file = _find_system_font([
                 "C:\\Windows\\Fonts\\arialbd.ttf",
                 "C:\\Windows\\Fonts\\calibrib.ttf",
-                "C:\\Windows\\Fonts\\trebucbd.ttf"
-            ]
-            for f in possible_bold_fonts:
-                if os.path.exists(f):
-                    bold_font_file = f
-                    break
-        else:  # Linux/other
-            possible_bold_fonts = [
+                "C:\\Windows\\Fonts\\trebucbd.ttf",
+            ])
+        else:
+            bold_font_file = _find_system_font([
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                 "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-                "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
-            ]
-            for f in possible_bold_fonts:
-                if os.path.exists(f):
-                    bold_font_file = f
-                    break
+                "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            ])
 
-    # Construct linear filters for the main video stream
-    linear_filters = []
+    # Construct filters for the main video stream
+    current_label = "[0:v]"
+    filter_parts = []
+    linear_chain = []
+    
+    def flush_linear_chain():
+        nonlocal current_label
+        if linear_chain:
+            next_label = f"[v_linear_{len(filter_parts)}]"
+            filter_parts.append(f"{current_label}{','.join(linear_chain)}{next_label}")
+            current_label = next_label
+            linear_chain.clear()
     
     # 1. Mirror video (hflip)
     if mirror_enabled:
-        linear_filters.append("hflip")
+        linear_chain.append("hflip")
         needs_video_encode = True
         
     # 2. Mask old subtitles
@@ -354,28 +376,62 @@ def render_final_video(
             subtitle_ass_path=subtitle_ass_path
         )
         
-        if y_min is not None and y_max is not None:
-            mask_filter = f"drawbox=x=0:y=ih*{y_min:.4f}:w=iw:h=ih*{(y_max - y_min):.4f}:color={mask_sub_color}:t=fill"
+        y_ratio = y_min if y_min is not None else (1.0 - mask_sub_y_ratio)
+        h_ratio = (y_max - y_min) if (y_min is not None and y_max is not None) else mask_sub_y_ratio
+        
+        # Calculate dynamic subtitle styling to align perfectly inside the box
+        if subtitle_file and subtitle_file.endswith(".ass"):
+            # Dùng video_height thực tế (không hardcode 1080)
+            box_height_px = video_height * h_ratio
+            y_center_ratio = y_ratio + (h_ratio / 2.0)
+            y_center_px = video_height * y_center_ratio
+            
+            # Auto fontsize: cân bằng giữa box height và tỷ lệ video height
+            # ~55% của box height để có padding hợp lý
+            # Cap ~6.2% của video_height để không quá lớn trên portrait
+            max_ass_fontsize = min(int(video_height * 0.062), int(box_height_px * 0.55))
+            fontsize = max(36, max_ass_fontsize)
+            
+            # MarginV: khoảng cách từ dưới video đến đáy subtitle
+            # (ASS Alignment=2 — bottom-center)
+            margin_v = int(video_height - y_center_px - (fontsize / 2.0))
+            margin_v = max(10, min(int(video_height * 0.22), margin_v))
+            
+            # Apply adjustments to the ASS file
+            adjust_ass_style(subtitle_file, fontsize, margin_v)
+            
+        if mask_sub_color.lower() == "blur":
+            flush_linear_chain()
+            orig_lbl = f"[v_orig_{len(filter_parts)}]"
+            blur_lbl = f"[v_blur_in_{len(filter_parts)}]"
+            blurred_lbl = f"[v_blurred_{len(filter_parts)}]"
+            out_lbl = f"[v_sub_masked_{len(filter_parts)}]"
+            
+            crop_height = int(video_height * h_ratio)
+            safe_radius = min(15, max(5, int(crop_height / 4) - 1))
+            
+            filter_parts.append(f"{current_label}split=2{orig_lbl}{blur_lbl}")
+            filter_parts.append(f"{blur_lbl}crop=w=iw:h=ih*{h_ratio:.4f}:x=0:y=ih*{y_ratio:.4f},boxblur={safe_radius}:5{blurred_lbl}")
+            filter_parts.append(f"{orig_lbl}{blurred_lbl}overlay=x=0:y=H*{y_ratio:.4f}{out_lbl}")
+            
+            current_label = out_lbl
         else:
-            mask_filter = f"drawbox=x=0:y=ih-ih*{mask_sub_y_ratio}:w=iw:h=ih*{mask_sub_y_ratio}:color={mask_sub_color}:t=fill"
-            print(f"           Subtitle Mask (Static Fallback): Enabled (y=ih-ih*{mask_sub_y_ratio}, h=ih*{mask_sub_y_ratio}, color={mask_sub_color})")
-        linear_filters.append(mask_filter)
+            mask_filter = f"drawbox=x=0:y=ih*{y_ratio:.4f}:w=iw:h=ih*{h_ratio:.4f}:color={mask_sub_color}:t=fill"
+            linear_chain.append(mask_filter)
         needs_video_encode = True
         
     # 2b. Mask top text (original subtitles / watermarks at the top)
     if top_text and not mask_top_text:
         mask_top_text = True
-
+ 
     if mask_top_text:
         top_mask_filter = f"drawbox=x=0:y=0:w=iw:h=ih*{mask_top_y_ratio:.4f}:color={mask_top_color}:t=fill"
-        linear_filters.append(top_mask_filter)
+        linear_chain.append(top_mask_filter)
         needs_video_encode = True
-
+ 
         if top_text:
-            video_width = video_info.get("width") or 1280
-            video_height = video_info.get("height") or 720
             box_height = int(video_height * mask_top_y_ratio)
-
+ 
             # Check if logo overlay is enabled and placed in top corners to prevent overlap
             logo_enabled = watermark_enabled and watermark_path and os.path.exists(watermark_path)
             left_margin = 20
@@ -386,14 +442,20 @@ def render_final_video(
                     left_margin = logo_w + 40
                 elif logo_position == "top-right":
                     right_margin = logo_w + 40
-
+ 
             w_avail = video_width - left_margin - right_margin
-
+ 
             # Parse text into highlight/normal segments
             top_segments = parse_highlight_text(top_text)
-
+ 
             # Calculate top text font size to fit box_height and w_avail
-            max_top_fontsize = int(box_height * 0.6)
+            # Cap theo cả tỷ lệ box_height (55%) lẫn tỷ lệ video_height (4.2%)
+            # — tránh font quá lớn trên TikTok portrait (video_height=1920)
+            max_top_fontsize = min(
+                int(box_height * 0.55),
+                int(video_height * 0.042)
+            )
+            max_top_fontsize = max(12, max_top_fontsize)
             top_fontsize = max_top_fontsize
             
             while top_fontsize > 12:
@@ -406,29 +468,34 @@ def render_final_video(
                     break
                 top_fontsize -= 2
             top_fontsize = max(12, top_fontsize)
-
+ 
             # Recalculate widths and compute starting position for centering
             total_width = 0
             for seg in top_segments:
                 seg_font = bold_font_file if (seg["highlight"] and bold_font_file) else font_file
                 seg["width"] = estimate_text_width(seg["text"], top_fontsize, bold=seg["highlight"], font_path=seg_font)
                 total_width += seg["width"]
-
+ 
             x_start = left_margin + (w_avail - total_width) / 2.0
             
-            # Calculate a constant y_val using font metrics to align baselines perfectly
+            # Dùng getbbox() của PIL để biết bounding box thực tế (chính xác hơn getmetrics)
+            # Giúp text luôn căn giữa theo chiều dọc trong box
             y_val = 0
             if font_file and os.path.exists(font_file):
                 try:
                     from PIL import ImageFont
                     font_metric = ImageFont.truetype(font_file, top_fontsize)
-                    ascent, descent = font_metric.getmetrics()
-                    y_val = int((box_height - (ascent + descent)) / 2.0)
+                    # getbbox trả về (left, top, right, bottom) của rendered text
+                    # Dùng ký tự có nét cao (Ag) để đo độ cao thực tế của font
+                    bbox = font_metric.getbbox("Ag")
+                    text_height = bbox[3] - bbox[1]  # bottom - top
+                    # Căn giữa: offset = (box_height - text_height) / 2, rồi bù thêm phần top offset
+                    y_val = max(0, int((box_height - text_height) / 2.0) - bbox[1])
                 except Exception:
-                    y_val = int((box_height - top_fontsize * 1.15) / 2.0)
+                    # Fallback: xấp xỉ với hệ số 0.82 cho phần body của font
+                    y_val = max(0, int((box_height - top_fontsize * 0.82) / 2.0))
             else:
-                y_val = int((box_height - top_fontsize * 1.15) / 2.0)
-            y_val = max(0, y_val)
+                y_val = max(0, int((box_height - top_fontsize * 0.82) / 2.0))
             
             current_x = x_start
             for seg in top_segments:
@@ -455,7 +522,7 @@ def render_final_video(
                     top_drawtext_opts.append(f"fontfile='{escaped_font}'")
                     
                 top_drawtext_filter = f"drawtext={':'.join(top_drawtext_opts)}"
-                linear_filters.append(top_drawtext_filter)
+                linear_chain.append(top_drawtext_filter)
                 
                 current_x += seg["width"]
         
@@ -463,16 +530,13 @@ def render_final_video(
     if subtitle_file:
         escaped_path = subtitle_file.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
         if subtitle_file.endswith(".ass"):
-            linear_filters.append(f"ass='{escaped_path}'")
+            linear_chain.append(f"ass='{escaped_path}'")
         else:
-            linear_filters.append(f"subtitles='{escaped_path}'")
+            linear_chain.append(f"subtitles='{escaped_path}'")
         needs_video_encode = True
         
     # 4. Logo & Watermark positioning & conflict resolution
     logo_enabled = watermark_enabled and watermark_path and os.path.exists(watermark_path)
-    
-    video_width = video_info.get("width") or 1280
-    video_height = video_info.get("height") or 720
     
     # Scale logo to 10% of video width to fit nicely
     logo_w = int(video_width * 0.1)
@@ -492,7 +556,7 @@ def render_final_video(
     elif logo_position == "center":
         logo_x_expr = "(W-w)/2"
         logo_y_expr = "(H-h)/2"
-
+ 
     # 4b. Default Watermark positioning
     top_offset = 20
     if mask_top_text:
@@ -508,7 +572,7 @@ def render_final_video(
         
     # Standard watermark fontsize
     fontsize = int(video_height * 0.05)
-
+ 
     watermark_pos_map = {
         "top-left": ("20", f"{top_offset}"),
         "top-right": ("w-text_w-20", f"{top_offset}"),
@@ -516,7 +580,7 @@ def render_final_video(
         "bottom-right": ("w-text_w-20", bottom_offset_expr),
         "center": ("(w-text_w)/2", "(h-text_h)/2")
     }
-
+ 
     # 4c. Conflict resolution: if both are enabled and at the same position
     if logo_enabled and watermark_text and (logo_position == watermark_position):
         # We need the estimated width of the watermark text
@@ -541,9 +605,9 @@ def render_final_video(
             
             watermark_x_val = int(logo_x_val + logo_w + 20)
             watermark_pos_map["center"] = (f"{watermark_x_val}", "(h-text_h)/2")
-
+ 
     x_expr, y_expr = watermark_pos_map.get(watermark_position, watermark_pos_map["center"])
-
+ 
     # 4d. Draw Watermark text
     if watermark_text:
         # Escaping for drawtext
@@ -564,20 +628,13 @@ def render_final_video(
             drawtext_opts.append(f"fontfile='{escaped_font}'")
             
         drawtext_filter = f"drawtext={':'.join(drawtext_opts)}"
-        linear_filters.append(drawtext_filter)
+        linear_chain.append(drawtext_filter)
         needs_video_encode = True
-
+ 
     # 5. Logo image overlay (using filter_complex)
-    logo_enabled = watermark_enabled and watermark_path and os.path.exists(watermark_path)
+    # Flush remaining linear filters before overlay
+    flush_linear_chain()
     
-    # We will build the filter complex parts
-    filter_parts = []
-    video_out = "[0:v]"
-    
-    if linear_filters:
-        filter_parts.append(f"[0:v]{','.join(linear_filters)}[v_filtered]")
-        video_out = "[v_filtered]"
-        
     if logo_enabled:
         cmd.extend(["-i", watermark_path])
         logo_idx = 2  # 0=video, 1=audio, 2=logo
@@ -585,14 +642,14 @@ def render_final_video(
         pos_expr = f"{logo_x_expr}:{logo_y_expr}"
         
         filter_parts.append(f"[{logo_idx}:v]scale={logo_w}:-1[scaled_logo]")
-        filter_parts.append(f"{video_out}[scaled_logo]overlay={pos_expr}[vout]")
-        video_out = "[vout]"
+        filter_parts.append(f"{current_label}[scaled_logo]overlay={pos_expr}[vout]")
+        current_label = "[vout]"
         needs_video_encode = True
         
     if needs_video_encode:
         if filter_parts:
             cmd.extend(["-filter_complex", ";".join(filter_parts)])
-            cmd.extend(["-map", video_out, "-map", "1:a"])
+            cmd.extend(["-map", current_label, "-map", "1:a"])
         else:
             cmd.extend(["-map", "0:v", "-map", "1:a"])
     else:
@@ -666,35 +723,29 @@ def render_final_video(
     if returncode != 0 and hw_available:
         print(f"           ⚠️  Hardware encoder failed (code {returncode}), falling back to libx264...")
         
-        # Rebuild command with software encoder
-        fallback_cmd = [c for c in cmd]
-        try:
-            vt_idx = fallback_cmd.index("h264_videotoolbox")
-            fallback_cmd[vt_idx] = "libx264"
-            # Remove VT-specific args and replace with CRF
-            for arg in ["-q:v", "-prio_speed"]:
-                if arg in fallback_cmd:
-                    idx = fallback_cmd.index(arg)
-                    fallback_cmd.pop(idx)  # Remove flag
-                    fallback_cmd.pop(idx)  # Remove value
-            # Remove hwaccel
-            if "-hwaccel" in fallback_cmd:
-                idx = fallback_cmd.index("-hwaccel")
-                fallback_cmd.pop(idx)  # Remove flag
-                fallback_cmd.pop(idx)  # Remove value
-            # Add CRF
-            enc_idx = fallback_cmd.index("libx264")
-            fallback_cmd.insert(enc_idx + 1, "-crf")
-            fallback_cmd.insert(enc_idx + 2, "22")
-            fallback_cmd.insert(enc_idx + 3, "-preset")
-            fallback_cmd.insert(enc_idx + 4, "fast")
-            fallback_cmd.insert(enc_idx + 5, "-threads")
-            fallback_cmd.insert(enc_idx + 6, "0")
-            
-            returncode = _run_ffmpeg_with_progress(fallback_cmd, total_duration, "libx264 SW (fallback)")
-        except (ValueError, IndexError):
-            # If fallback reconstruction fails, just report original error
-            pass
+        # Build a clean software-encoder command from scratch (safer than mutating the HW cmd)
+        sw_quality_map = {
+            "fast":     {"crf": "26", "preset": "veryfast"},
+            "balanced": {"crf": "22", "preset": "fast"},
+            "high":     {"crf": "18", "preset": "medium"},
+        }
+        sw_q = sw_quality_map.get(quality, sw_quality_map["balanced"])
+
+        # Reconstruct cmd: replace encoder block, keep everything else identical
+        fallback_cmd = []
+        skip_next = False
+        for i, token in enumerate(cmd):
+            if skip_next:
+                skip_next = False
+                continue
+            if token == "h264_videotoolbox":
+                fallback_cmd.extend(["libx264", "-crf", sw_q["crf"], "-preset", sw_q["preset"], "-threads", "0"])
+            elif token in ("-q:v", "-prio_speed", "-profile:v"):
+                skip_next = True  # skip this flag AND its value
+            else:
+                fallback_cmd.append(token)
+
+        returncode = _run_ffmpeg_with_progress(fallback_cmd, total_duration, "libx264 SW (fallback)")
     
     elapsed = time.time() - start_time
     
@@ -714,6 +765,33 @@ def render_final_video(
     else:
         print(f"[Module 7] ❌ FFmpeg failed with exit code {returncode}")
         return None
+
+
+def adjust_ass_style(ass_path: str, fontsize: int, margin_v: int):
+    """Adjust the Fontsize and MarginV parameters of Style: Default in ASS file."""
+    if not ass_path or not os.path.exists(ass_path):
+        return
+    try:
+        with open(ass_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            
+        modified = False
+        for i, line in enumerate(lines):
+            if line.startswith("Style:"):
+                parts = line.split(",")
+                if len(parts) >= 22 and parts[0].strip() == "Style: Default":
+                    parts[2] = str(fontsize)
+                    parts[21] = str(margin_v)
+                    lines[i] = ",".join(parts)
+                    modified = True
+                    break
+                    
+        if modified:
+            with open(ass_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            print(f"           ✅ Adjusted ASS style: Fontsize={fontsize}, MarginV={margin_v}")
+    except Exception as e:
+        print(f"           ⚠️ Failed to adjust ASS style: {e}")
 
 
 def _parse_srt_timestamps(srt_path: str) -> list:
@@ -777,13 +855,16 @@ def detect_subtitle_bounding_box(
 ) -> tuple:
     """
     Detect the exact vertical coordinates (y_min_ratio, y_max_ratio) of burned-in subtitles in the video.
-    Returns (y_min_ratio, y_max_ratio) or (None, None) if detection fails or cv2 is not installed.
+    First tries to detect using Tesseract OCR with a density accumulator (clustering),
+    and falls back to OpenCV contour detection (also with density accumulator) if Tesseract is not available.
     """
     try:
         import cv2
         import numpy as np
+        import shutil
+        import tempfile
     except ImportError:
-        print("           ⚠️ OpenCV (opencv-python) is not installed. Skipping dynamic subtitle detection.")
+        print("           ⚠️ OpenCV (opencv-python) or numpy is not installed. Skipping dynamic subtitle detection.")
         return None, None
 
     # 1. Get sample timestamps from subtitle files
@@ -811,14 +892,14 @@ def detect_subtitle_bounding_box(
     # 2. Pick sample points (midpoints of speech segments)
     sample_times = []
     if dialogue_times:
-        # Sample midpoints of segments, up to 10 points
+        # Sample midpoints of segments, up to 15 points for better accuracy
         for start, end in dialogue_times:
             mid = (start + end) / 2.0
             if mid < duration:
                 sample_times.append(mid)
-        # Limit to at most 10 segments evenly distributed
-        if len(sample_times) > 10:
-            indices = np.linspace(0, len(sample_times) - 1, 10, dtype=int)
+        # Limit to at most 15 segments evenly distributed
+        if len(sample_times) > 15:
+            indices = np.linspace(0, len(sample_times) - 1, 15, dtype=int)
             sample_times = [sample_times[i] for i in indices]
     else:
         # Fallback: if no subtitle timings are available, sample every 5s in the middle 50% of the video
@@ -829,74 +910,143 @@ def detect_subtitle_bounding_box(
         else:
             sample_times = [duration * 0.5]
 
-    print(f"           Detecting subtitle position using OpenCV (analyzing {len(sample_times)} frames)...")
-    detected_y_ranges = []
+    # Check if Tesseract is available
+    tesseract_path = shutil.which("tesseract")
+    # Also check common macOS Homebrew path if not in standard PATH
+    if not tesseract_path and os.path.exists("/opt/homebrew/bin/tesseract"):
+        tesseract_path = "/opt/homebrew/bin/tesseract"
+
+    # Search crop boundary: subtitles are expected in the bottom 35% of height
+    y_crop_start = int(height * 0.65)
     
-    # We only search in the bottom 30% of the video height (where subtitles are expected)
-    y_crop_start = int(height * 0.70)
-    
-    for t in sample_times:
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            continue
-            
-        crop = frame[y_crop_start:, :]
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    # We will accumulate vertical density votes to identify subtitle band
+    votes = np.zeros(height, dtype=int)
+    using_ocr = False
+
+    if tesseract_path:
+        print(f"           Detecting subtitle position using Tesseract OCR (analyzing {len(sample_times)} frames)...")
+        using_ocr = True
         
-        # Binary threshold to capture white/yellow subtitle text
-        # Usually subtitles have high luminance (value > 200)
-        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-        
-        # Dilate horizontally to group text characters into blocks
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 5))
-        dilated = cv2.dilate(thresh, kernel, iterations=2)
-        
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            
-            # Subtitle detection heuristic filters:
-            # - Bounding box width must be at least 8% of video width
-            # - Bounding box height must be between 1.5% and 12% of video height
-            # - Bounding box must be relatively centered horizontally (e.g. center x within 15% to 85% of width)
-            is_wide = w > int(width * 0.08)
-            is_valid_height = int(height * 0.015) < h < int(height * 0.12)
-            is_centered = int(width * 0.15) < (x + w/2) < int(width * 0.85)
-            
-            if is_wide and is_valid_height and is_centered:
-                y_top_orig = y_crop_start + y
-                y_bottom_orig = y_crop_start + y + h
-                detected_y_ranges.append((y_top_orig, y_bottom_orig))
+        for idx, t in enumerate(sample_times):
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
                 
+            crop = frame[y_crop_start:, :]
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            
+            # High-threshold to isolate white/yellow text and reduce background noise
+            _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY)
+            
+            # Save cropped thresholded image to a temporary file
+            temp_crop_path = os.path.join(tempfile.gettempdir(), f"ocr_detect_{idx}.png")
+            cv2.imwrite(temp_crop_path, thresh)
+            
+            try:
+                cmd = [tesseract_path, temp_crop_path, "stdout", "--psm", "11", "tsv"]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split("\n")
+                    for line in lines[1:]:
+                        parts = line.split("\t")
+                        if len(parts) >= 12:
+                            try:
+                                conf = float(parts[10])
+                                text = parts[11].strip()
+                                # Only count words that have decent confidence and are not empty
+                                if conf > 15 and text:
+                                    left = int(parts[6])
+                                    top = int(parts[7])
+                                    w = int(parts[8])
+                                    h = int(parts[9])
+                                    
+                                    # Horizontal centering heuristic to avoid page margins, logos, watermark text
+                                    is_centered = int(width * 0.15) < (left + w/2) < int(width * 0.85)
+                                    is_valid_height = int(height * 0.015) < h < int(height * 0.12)
+                                    
+                                    if is_centered and is_valid_height:
+                                        y_top_orig = y_crop_start + top
+                                        y_bottom_orig = y_crop_start + top + h
+                                        votes[y_top_orig:y_bottom_orig] += 1
+                            except ValueError:
+                                continue
+            except Exception as e:
+                print(f"           ⚠️ OCR execution failed on frame {idx}: {e}")
+            finally:
+                if os.path.exists(temp_crop_path):
+                    try:
+                        os.remove(temp_crop_path)
+                    except Exception:
+                        pass
+    
+    # Fallback to OpenCV Contour Accumulator if OCR is not available or didn't find anything
+    if not using_ocr or np.max(votes) < 2:
+        if using_ocr:
+            print("           ⚠️ OCR detection found no clear subtitle region. Falling back to OpenCV Contours...")
+        else:
+            print(f"           Detecting subtitle position using OpenCV contours (analyzing {len(sample_times)} frames)...")
+            
+        votes.fill(0) # Reset votes
+        for t in sample_times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+                
+            crop = frame[y_crop_start:, :]
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 5))
+            dilated = cv2.dilate(thresh, kernel, iterations=2)
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                is_wide = w > int(width * 0.08)
+                is_valid_height = int(height * 0.015) < h < int(height * 0.12)
+                is_centered = int(width * 0.15) < (x + w/2) < int(width * 0.85)
+                
+                if is_wide and is_valid_height and is_centered:
+                    y_top_orig = y_crop_start + y
+                    y_bottom_orig = y_crop_start + y + h
+                    votes[y_top_orig:y_bottom_orig] += 1
+                    
     cap.release()
     
-    if not detected_y_ranges:
-        print("           ⚠️ No subtitles detected in sample frames. Using configuration fallback.")
+    max_votes = np.max(votes)
+    if max_votes == 0:
+        print("           ⚠️ No subtitles detected. Using configuration fallback.")
         return None, None
-
-    # Group detected coordinates and find the median bounding box
-    y_tops = [r[0] for r in detected_y_ranges]
-    y_bottoms = [r[1] for r in detected_y_ranges]
+        
+    # Find contiguous range where votes are at least 40% of max_votes (minimum of 2 votes)
+    # starting from the peak vote y-coordinate (expansion from peak)
+    peak_y = int(np.argmax(votes))
+    threshold_votes = max(2, int(max_votes * 0.4))
     
-    median_top = np.median(y_tops)
-    median_bottom = np.median(y_bottoms)
+    # Expand left from the peak
+    median_top = peak_y
+    while median_top > 0 and votes[median_top - 1] >= threshold_votes:
+        median_top -= 1
+        
+    # Expand right from the peak
+    median_bottom = peak_y
+    while median_bottom < height - 1 and votes[median_bottom + 1] >= threshold_votes:
+        median_bottom += 1
     
     # Check if height is reasonable
     detected_height = median_bottom - median_top
-    if detected_height < int(height * 0.01) or detected_height > int(height * 0.15):
-        print("           ⚠️ Detected vertical range is unrealistic. Using configuration fallback.")
+    if detected_height < int(height * 0.015) or detected_height > int(height * 0.15):
+        print(f"           ⚠️ Detected vertical range ({detected_height}px) is unrealistic. Using configuration fallback.")
         return None, None
 
-    # Add padding (approx 1% of video height or at least 8 pixels)
-    padding = max(8, int(height * 0.01))
+    # Add padding (approx 1.2% of video height or at least 10 pixels)
+    padding = max(10, int(height * 0.012))
     final_top = max(0, int(median_top - padding))
-    # To prevent "hở bottom", extend the mask box all the way to the bottom of the video frame
-    final_bottom = height
+    final_bottom = min(height, int(median_bottom + padding))
     
     y_min_ratio = final_top / height
-    y_max_ratio = 1.0
+    y_max_ratio = final_bottom / height
     
     print(f"           ✅ Detected subtitle region: y_min={y_min_ratio:.3f} ({final_top}px), "
           f"y_max={y_max_ratio:.3f} ({final_bottom}px), height={final_bottom - final_top}px")

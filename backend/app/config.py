@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 LM_STUDIO_BASE_URL_DEFAULT = "http://localhost:1234/v1"
 LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", LM_STUDIO_BASE_URL_DEFAULT)
@@ -10,12 +10,21 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
 
+# ElevenLabs TTS configuration
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Default: Adam
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_v3")  # eleven_v3 supports audio tags
+ELEVENLABS_CONCURRENCY = int(os.getenv("ELEVENLABS_CONCURRENCY", "3"))  # Keep low for free tier
+
 
 
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "medium")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "4"))
+# Transcribe backend: 'auto' (default) | 'mlx' (Apple GPU) | 'cpu' | 'groq' (cloud API)
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 TTS_ENGINE = os.getenv("TTS_ENGINE", "edge-tts")
 TTS_VOICE = os.getenv("TTS_VOICE", "vi-VN-HoaiMyNeural")
 TTS_CONCURRENCY = int(os.getenv("TTS_CONCURRENCY", "2"))
@@ -25,7 +34,7 @@ TTS_DYNAMIC_SPEEDUP = os.getenv("TTS_DYNAMIC_SPEEDUP", "True").lower() == "true"
 
 MASK_OLD_SUBS = os.getenv("MASK_OLD_SUBS", "True").lower() == "true"
 MASK_SUB_Y_RATIO = float(os.getenv("MASK_SUB_Y_RATIO", "0.15"))
-MASK_SUB_COLOR = os.getenv("MASK_SUB_COLOR", "black")
+MASK_SUB_COLOR = os.getenv("MASK_SUB_COLOR", "blur")
 
 # Logo and Watermark settings
 LOGO_PATH = os.getenv("LOGO_PATH", "")
@@ -55,6 +64,7 @@ PITCH_METHOD = os.getenv("PITCH_METHOD", "none")
 PITCH_MAX_SHIFT_SEMITONES = float(os.getenv("PITCH_MAX_SHIFT_SEMITONES", "6.0"))
 PITCH_F0_BLEND_RATIO = float(os.getenv("PITCH_F0_BLEND_RATIO", "0.7"))
 
-
-
-
+# Subtitle settings
+SUBTITLE_MAX_CHARS_PER_LINE = int(os.getenv("SUBTITLE_MAX_CHARS_PER_LINE", "42"))
+SUBTITLE_MAX_LINES_BEFORE_SPLIT = int(os.getenv("SUBTITLE_MAX_LINES_BEFORE_SPLIT", "1"))
+SUBTITLE_MIN_SEGMENT_DURATION = float(os.getenv("SUBTITLE_MIN_SEGMENT_DURATION", "0.5"))

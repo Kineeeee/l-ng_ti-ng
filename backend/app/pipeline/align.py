@@ -1,7 +1,6 @@
 import os
 import time
 import subprocess
-import struct
 import wave
 from pydub import AudioSegment
 from backend.app.config import (
@@ -12,50 +11,28 @@ from backend.app.config import (
     TTS_VOLUME_DB,
     AUDIO_SYNC_OFFSET_MS
 )
+from backend.app.pipeline.audio_utils import (
+    get_wav_duration_fast as _get_wav_duration_fast,
+    trim_silence as _trim_silence,
+)
 
 # Target sample rate for dubbed audio
 # 24kHz matches edge-tts native output → avoids quality loss from downsample+upsample
 DUBBED_SAMPLE_RATE = 24000
 
 
-def _get_wav_duration_fast(wav_path: str) -> float:
-    """
-    Get WAV file duration using the wave module (header-only read).
-    ~10x faster than AudioSegment.from_wav() which decodes the entire file.
-    """
-    try:
-        with wave.open(wav_path, 'rb') as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            if rate > 0:
-                return frames / rate
-    except Exception:
-        pass
-    # Fallback: estimate from file size (16-bit mono PCM)
-    try:
-        size = os.path.getsize(wav_path)
-        # WAV header is typically 44 bytes, 16-bit mono = 2 bytes per sample
-        return max(0, (size - 44)) / (2 * 16000)
-    except Exception:
-        return 0.5
-
-
 def _speed_up_with_ffmpeg(input_path: str, output_path: str, speed_ratio: float) -> bool:
     """
     Speed up audio using FFmpeg atempo filter.
     Higher quality than pydub.speedup() — no chunk overlap artifacts.
-    atempo range: 0.5-2.0, so for >2.0x we chain filters.
     """
-    # Cap to reasonable range
     speed_ratio = max(1.01, min(speed_ratio, 2.0))
-    
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
         "-filter:a", f"atempo={speed_ratio:.4f}",
         "-ar", str(DUBBED_SAMPLE_RATE), "-ac", "1",
         output_path
     ]
-    
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
@@ -64,15 +41,10 @@ def _speed_up_with_ffmpeg(input_path: str, output_path: str, speed_ratio: float)
 
 
 def merge_intervals(intervals: list, gap_threshold_ms: int = 800) -> list:
-    """
-    Merges intervals that are close to each other or overlap,
-    returning a list of (start_ms, end_ms) intervals.
-    """
+    """Merge overlapping or nearby (start_ms, end_ms) intervals."""
     if not intervals:
         return []
-        
     intervals.sort(key=lambda x: x[0])
-    
     merged = [intervals[0]]
     for current_start, current_end in intervals[1:]:
         last_start, last_end = merged[-1]
@@ -80,33 +52,7 @@ def merge_intervals(intervals: list, gap_threshold_ms: int = 800) -> list:
             merged[-1] = (last_start, max(last_end, current_end))
         else:
             merged.append((current_start, current_end))
-            
     return merged
-
-
-def _detect_leading_silence(sound: AudioSegment, silence_threshold: float = -50.0, chunk_size: int = 10) -> int:
-    """Detect leading silence in milliseconds."""
-    trim_ms = 0
-    duration = len(sound)
-    while trim_ms < duration and sound[trim_ms:trim_ms+chunk_size].dBFS < silence_threshold:
-        trim_ms += chunk_size
-    return trim_ms
-
-
-def _trim_silence(sound: AudioSegment, silence_threshold: float = -50.0, chunk_size: int = 10, keep_silence_ms: int = 30) -> AudioSegment:
-    """Trim leading and trailing silence from an AudioSegment with a cushion."""
-    duration = len(sound)
-    start_trim = _detect_leading_silence(sound, silence_threshold, chunk_size)
-    reversed_sound = sound.reverse()
-    end_trim = _detect_leading_silence(reversed_sound, silence_threshold, chunk_size)
-    
-    trimmed_start = max(0, start_trim - keep_silence_ms)
-    trimmed_end = min(duration, (duration - end_trim) + keep_silence_ms)
-    
-    if trimmed_start >= trimmed_end:
-        return AudioSegment.silent(duration=100, frame_rate=sound.frame_rate).set_channels(sound.channels)
-        
-    return sound[trimmed_start:trimmed_end]
 
 
 def align_and_merge_audio(
@@ -297,5 +243,3 @@ def align_and_merge_audio(
 
 if __name__ == "__main__":
     pass
-
-

@@ -141,8 +141,19 @@ def check_and_convert_json_cookies():
         return
 
     output_path = "cookies.txt"
-    # Check if cookies.txt is already newer than the JSON file to avoid redundant conversion
-    if os.path.exists(output_path) and os.path.getmtime(output_path) >= newest_time:
+    mtime_tracker_path = "cookies.txt.mtime"
+    # Check if cookies.txt exists and matches the last converted JSON mtime to avoid redundant conversion
+    already_converted = False
+    if os.path.exists(output_path) and os.path.exists(mtime_tracker_path):
+        try:
+            with open(mtime_tracker_path, "r") as mf:
+                last_converted_time = float(mf.read().strip())
+            if last_converted_time == newest_time:
+                already_converted = True
+        except Exception:
+            pass
+
+    if already_converted:
         return
 
     print(f"[Module 1] Found JSON cookie file: {json_path}. Converting to Netscape format...")
@@ -197,11 +208,17 @@ def check_and_convert_json_cookies():
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
+        try:
+            with open(mtime_tracker_path, "w") as mf:
+                mf.write(str(newest_time))
+        except Exception:
+            pass
+
         print(f"[Module 1] Successfully converted {len(cookies)} cookies to {output_path}")
     except Exception as e:
         print(f"[Warning] Failed to convert JSON cookies: {e}")
 
-def download_video(video_url: str, output_dir: str = "output") -> dict:
+def download_video(video_url: str, output_dir: str = "output", job_id: str = None) -> dict:
     """
     Downloads the video using yt-dlp and extracts a 16kHz mono audio WAV file.
     """
@@ -217,8 +234,9 @@ def download_video(video_url: str, output_dir: str = "output") -> dict:
             video_url = f"https://www.douyin.com/video/{video_id}"
             print(f"[Module 1] Normalized Douyin URL to: {video_url}")
 
-    # Generate unique ID for this download session
-    job_id = str(uuid.uuid4())[:8]
+    # Generate unique ID for this download session if not provided
+    if not job_id:
+        job_id = str(uuid.uuid4())[:8]
     base_path = os.path.join(output_dir, job_id)
     video_path = f"{base_path}.mp4"
     audio_path = f"{base_path}.wav"
@@ -293,6 +311,28 @@ def download_video(video_url: str, output_dir: str = "output") -> dict:
     t_download = time.time() - t0
     print(f"[Module 1] Video downloaded in {t_download:.1f}s")
 
+    print(f"[Module 1] Adjusting video speed to 0.8x...")
+    t_speed = time.time()
+    slow_video_path = f"{base_path}_slow.mp4"
+    speed_command = [
+        "ffmpeg", "-y",
+        "-threads", "0",
+        "-i", actual_video_path,
+        "-filter:v", "setpts=1.25*PTS",
+        "-filter:a", "atempo=0.8",
+        slow_video_path
+    ]
+    try:
+        subprocess.run(speed_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.remove(actual_video_path)
+        os.rename(slow_video_path, actual_video_path)
+        duration = float(duration) / 0.8
+        print(f"[Module 1] Video speed adjusted in {time.time() - t_speed:.1f}s")
+    except Exception as e:
+        print(f"[Warning] Failed to adjust video speed: {e}")
+        if os.path.exists(slow_video_path):
+            os.remove(slow_video_path)
+
     print(f"[Module 1] Extracting 16kHz mono audio to {audio_path}...")
     t1 = time.time()
     # Extract audio using ffmpeg with multithreading
@@ -316,7 +356,8 @@ def download_video(video_url: str, output_dir: str = "output") -> dict:
         "video_path": actual_video_path,
         "audio_path": audio_path,
         "duration_sec": float(duration),
-        "resolution": resolution
+        "resolution": resolution,
+        "job_id": job_id
     }
 
 if __name__ == "__main__":

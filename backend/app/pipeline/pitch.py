@@ -409,6 +409,31 @@ def apply_f0_contour_clone(
         return False
 
 
+def apply_hoat_ngon_pitch_shift(
+    tts_wav_path: str,
+    output_path: str,
+    n_steps: float = 3.5,
+) -> bool:
+    """
+    Phương án 3: Biến đổi giọng TTS theo phong cách 'Cô gái hoạt ngôn' (CapCut style).
+    Đẩy cao độ (pitch) lên ~+3.5 semitones để tạo tông giọng tươi trẻ, nhanh nhẹn và hoạt ngôn.
+    Không phụ thuộc vào file âm thanh gốc.
+    """
+    librosa = _import_librosa()
+    try:
+        y, sr = _load_mono_float32(tts_wav_path, sr=ANALYSIS_SR)
+        y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
+        _save_float32_to_wav(y_shifted, sr, output_path)
+        print(f"           [Hoạt-Ngôn] Shift +{n_steps:.1f} semitones → {os.path.basename(output_path)}")
+        return True
+    except Exception as e:
+        print(f"           [Hoạt-Ngôn] ⚠ Lỗi: {e}. Dùng TTS gốc.")
+        import shutil
+        if tts_wav_path != output_path:
+            shutil.copy2(tts_wav_path, output_path)
+        return False
+
+
 # ─── Entry Point Chính ────────────────────────────────────────────────────────
 
 def apply_pitch_to_segment(
@@ -417,12 +442,12 @@ def apply_pitch_to_segment(
     orig_start_sec: float,
     orig_end_sec: float,
     output_path: str,
-    method: str = "shift",         # "shift" | "clone" | "none"
+    method: str = "shift",         # "shift" | "clone" | "hoat_ngon" | "none"
     max_shift_semitones: float = 6.0,
     f0_blend_ratio: float = 0.7,
 ) -> bool:
     """
-    Áp dụng xử lý cao độ lên TTS audio dựa theo âm thanh gốc.
+    Áp dụng xử lý cao độ lên TTS audio dựa theo âm thanh gốc hoặc preset.
 
     Args:
         tts_wav_path: WAV file từ TTS (input).
@@ -431,9 +456,10 @@ def apply_pitch_to_segment(
         orig_end_sec: Thời điểm kết thúc segment trong âm thanh gốc (giây).
         output_path: Đường dẫn lưu WAV đã xử lý pitch (output).
         method: Phương pháp:
-            "shift" → Phương án 1: Simple Pitch Shift
-            "clone" → Phương án 2: F0 Contour Cloning
-            "none"  → Bỏ qua, copy thẳng
+            "shift"     → Phương án 1: Simple Pitch Shift (match pitch gốc)
+            "clone"     → Phương án 2: F0 Contour Cloning (nhại ngữ điệu)
+            "hoat_ngon" → Phương án 3: Giọng Cô gái hoạt ngôn CapCut (+3.5 semitones)
+            "none"      → Bỏ qua, copy thẳng
         max_shift_semitones: Giới hạn shift cho method="shift".
         f0_blend_ratio: Tỷ lệ blend F0 cho method="clone".
 
@@ -444,6 +470,9 @@ def apply_pitch_to_segment(
         import shutil
         shutil.copy2(tts_wav_path, output_path)
         return True
+
+    if method in ["hoat_ngon", "hoat-ngon"]:
+        return apply_hoat_ngon_pitch_shift(tts_wav_path, output_path, n_steps=3.5)
 
     if not os.path.exists(orig_wav_path):
         print(f"           [Pitch] ⚠ Không tìm thấy orig audio: {orig_wav_path}")
@@ -476,7 +505,7 @@ def apply_pitch_to_segment(
             )
         return success
     else:
-        print(f"           [Pitch] ⚠ Method không hợp lệ: '{method}'. Dùng 'shift' | 'clone' | 'none'.")
+        print(f"           [Pitch] ⚠ Method không hợp lệ: '{method}'. Dùng 'shift' | 'clone' | 'hoat_ngon' | 'none'.")
         import shutil
         shutil.copy2(tts_wav_path, output_path)
         return False
