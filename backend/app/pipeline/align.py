@@ -108,7 +108,7 @@ def align_and_merge_audio(
         tts_duration_ms = len(segment_audio)
         
         # Perform dynamic speed up if the clip is too long for its slot
-        if TTS_DYNAMIC_SPEEDUP and tts_duration_ms > target_duration_ms * 1.15:
+        if TTS_DYNAMIC_SPEEDUP and target_duration_ms > 0 and tts_duration_ms > target_duration_ms * 1.15:
             speed_ratio = tts_duration_ms / target_duration_ms
             speed_ratio = min(speed_ratio, 1.3)
             

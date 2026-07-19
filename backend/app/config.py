@@ -6,6 +6,7 @@ load_dotenv(override=True)
 LM_STUDIO_BASE_URL_DEFAULT = "http://localhost:1234/v1"
 LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", LM_STUDIO_BASE_URL_DEFAULT)
 TRANSLATION_PROVIDER = os.getenv("TRANSLATION_PROVIDER", "lm_studio") # 'lm_studio' or 'gemini'
+TRANSLATION_STYLE = os.getenv("TRANSLATION_STYLE", "humorous") # 'standard', 'humorous', or 'storyteller'
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
@@ -68,3 +69,14 @@ PITCH_F0_BLEND_RATIO = float(os.getenv("PITCH_F0_BLEND_RATIO", "0.7"))
 SUBTITLE_MAX_CHARS_PER_LINE = int(os.getenv("SUBTITLE_MAX_CHARS_PER_LINE", "42"))
 SUBTITLE_MAX_LINES_BEFORE_SPLIT = int(os.getenv("SUBTITLE_MAX_LINES_BEFORE_SPLIT", "1"))
 SUBTITLE_MIN_SEGMENT_DURATION = float(os.getenv("SUBTITLE_MIN_SEGMENT_DURATION", "0.5"))
+
+# OCR Subtitle settings
+ENABLE_OCR_SUBTITLE = os.getenv("ENABLE_OCR_SUBTITLE", "True").lower() == "true"
+OCR_CROP_BOTTOM_RATIO = float(os.getenv("OCR_CROP_BOTTOM_RATIO", "0.25"))
+OCR_SAMPLE_FPS = float(os.getenv("OCR_SAMPLE_FPS", "3.0"))
+OCR_MIN_CONFIDENCE = float(os.getenv("OCR_MIN_CONFIDENCE", "0.5"))
+
+# Download & Video Speed settings
+VIDEO_SPEED_FACTOR = float(os.getenv("VIDEO_SPEED_FACTOR", "0.7"))
+
+

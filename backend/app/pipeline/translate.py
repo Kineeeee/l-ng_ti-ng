@@ -3,9 +3,34 @@ import time
 from openai import OpenAI
 from google import genai
 from backend.app.config import (
-    LM_STUDIO_BASE_URL, TRANSLATION_PROVIDER,
+    LM_STUDIO_BASE_URL, TRANSLATION_PROVIDER, TRANSLATION_STYLE,
     GEMINI_API_KEY, GEMINI_MODEL, TRANSLATION_BATCH_SIZE
 )
+
+
+def _get_style_instructions(translation_style: str) -> str:
+    style = (translation_style or "standard").lower()
+    if style == "humorous":
+        return """PHONG CÁCH DỊCH: HÀI HƯỚC, BÌNH LUẬN & FAIR USE (REACTION/REVIEW)
+- Bạn là một reviewer/biên tập viên video dí dỏm, hài hước trên TikTok/Reels/Shorts.
+- THÊM CÂU CẢM THÁN & LỜI BÌNH TỰ NHIÊN: Đừng dịch khô khan từng từ. Hãy linh hoạt chèn các câu cảm thán ngắn, từ cảm xúc hoặc bình luận dí dỏm theo góc nhìn cá nhân phù hợp với ngữ cảnh từng câu thoại.
+- KHO CÂU CẢM THÁN GỢI Ý (Bạn có thể chọn từ danh sách này HOẶC TỰ SÁNG TẠO câu phù hợp nhất với ngữ cảnh):
+  + Ngạc nhiên / Bất ngờ: 'Trời ơi tin được không!', 'Ảo thật đấy!', 'Úi giời ơi!', 'Cái gì cơ?', 'Không thể tin nổi!', 'Cái quái gì thế này?'
+  + Thắc mắc / Khơi gợi: 'Ủa alo?', 'Ủa rồi sao nữa?', 'Ủa là sao?', 'Lạ đời chưa?', 'Hợp lý chưa?'
+  + Bất lực / Tẻ nhạt / Số nhọ: 'Xu cà na chưa!', 'Đúng là số nhọ!', 'Tới công chuyện luôn!', 'Cạn lời!', 'Khó thế mà cũng nghĩ ra được!', 'Bái phục luôn!'
+  + Thích thú / Cười cợt: 'Cười muốn rớt hàm!', 'Nhìn mà thèm!', 'Đỉnh kout chưa!', 'Mê chưa mê chưa!'
+- NGUYÊN TẮC TIẾT CHẾ & TỰ NHIÊN (CỰC KỲ QUAN TRỌNG):
+  1. KHÔNG lạm dụng chèn câu cảm thán vào TẤT CẢ các câu khiến bài thuyết minh bị lố, gượng ép hoặc mất tự nhiên. CHỈ thêm vào những phân đoạn có điểm nhấn hài hước hoặc cảm xúc.
+  2. Phải hoàn toàn ĐÚNG NGỮ CẢNH của tình huống trong video.
+  3. LƯU Ý ĐỘ DÀI: Các câu bình luận/cảm thán thêm vào phải NGẮN GỌN, súc tích để người lồng tiếng đọc kịp thời lượng video gốc."""
+    elif style == "storyteller":
+        return """PHONG CÁCH DỊCH: KỂ CHUYỆN KỊCH TÍNH & TIKTOK VIRAL (STORYTELLER)
+- Bạn là người kể chuyện video viral chuyên nghiệp, giật tít và cuốn hút người nghe từ giây đầu tiên.
+- SỬ DỤNG TỪ NGHỮ BẮT TREND: Dùng văn phong kịch tính, đẩy cao trào cảm xúc, nhấn mạnh tính tò mò và kịch tính của câu chuyện.
+- LƯU Ý ĐỘ DÀI: Đảm bảo nhịp điệu dồn dập nhưng ngắn gọn, vừa vặn với thời lượng âm thanh gốc."""
+    else:
+        return """PHONG CÁCH DỊCH: TRUYỀN THỐNG / THUYẾT MINH CHUẨN (STANDARD)
+- Dịch tự nhiên, đúng ngữ cảnh, chuẩn văn phong nói tiếng Việt phù hợp để lồng tiếng nói."""
 
 
 def _build_prompt(
@@ -13,7 +38,8 @@ def _build_prompt(
     source_language: str,
     history_context: list = None,
     future_context: list = None,
-    auto_audio_tags: bool = False
+    auto_audio_tags: bool = False,
+    translation_style: str = "standard"
 ) -> str:
     """Build translation prompt for a batch of segments with context support."""
     # Build history context string
@@ -43,11 +69,15 @@ def _build_prompt(
     if auto_audio_tags:
         audio_tags_instruction = "\n4. THẺ CẢM XÚC (AUDIO TAGS): Vì văn bản sẽ được đọc bằng ElevenLabs TTS, hãy tự động chèn các thẻ cảm xúc tiếng Anh (ví dụ: [laughs], [sighs], [gasps], [angry], [crying], [whispers], [clears throat]) vào bản dịch tiếng Việt nếu ngữ cảnh đòi hỏi cảm xúc đó. Không lạm dụng."
 
-    return f"""Bạn là chuyên gia dịch thuật lồng tiếng và thuyết minh video chuyên nghiệp. Hãy dịch các câu được yêu cầu dưới đây từ {source_language} sang tiếng Việt với phong cách tự nhiên, sinh động (phù hợp để lồng tiếng nói), duy trì đại từ nhân xưng nhất quán và giữ đúng ngữ cảnh.
+    style_instruction = _get_style_instructions(translation_style)
+
+    return f"""Bạn là chuyên gia dịch thuật lồng tiếng và thuyết minh video chuyên nghiệp. Hãy dịch/chuyển thể các câu được yêu cầu dưới đây từ {source_language} sang tiếng Việt với ngữ cảnh phù hợp.
+
+{style_instruction}
 
 ĐẶC BIỆT LƯU Ý KHI DỊCH LỒNG TIẾNG:
-1. BẢO TOÀN SỰ NHẤN MẠNH VÀ LẶP TỪ: Nếu câu gốc lặp từ để nhấn mạnh cường độ hoặc cảm xúc (ví dụ: 'really really really long', 'very very slow', 'go go go'), bạn CẦN dịch lặp lại tương ứng trong tiếng Việt (ví dụ: 'rất rất rất dài', 'rất rất chậm', 'đi đi đi') thay vì dịch tóm gọn ('rất dài', 'chậm', 'đi'). Không được lược bỏ các từ biểu thị sắc thái cảm xúc hoặc mức độ.
-2. TƯƠNG ĐỒNG ĐỘ DÀI/NHỊP ĐIỆU: Đảm bảo độ dài và nhịp điệu của bản dịch tiếng Việt tương đương với câu gốc để người nói lồng tiếng có thể đọc khớp thời gian với video gốc. Tránh dịch quá ngắn gọn làm mất nhịp điệu.
+1. BẢO TOÀN SỰ NHẤN MẠNH VÀ LẶP TỪ: Nếu câu gốc lặp từ để nhấn mạnh cường độ hoặc cảm xúc (ví dụ: 'really really really long', 'very very slow', 'go go go'), bạn CẦN dịch lặp lại tương ứng trong tiếng Việt (ví dụ: 'rất rất rất dài', 'rất rất chậm', 'đi đi đi') thay vì dịch tóm gọn.
+2. TƯƠNG ĐỒNG ĐỘ DÀI/NHỊP ĐIỆU: Đảm bảo độ dài và nhịp điệu của bản dịch tiếng Việt tương đương với câu gốc để người nói lồng tiếng có thể đọc khớp thời gian với video gốc. Tránh dịch quá ngắn gọn làm mất nhịp điệu hoặc quá dài làm vỡ timing.
 3. VĂN PHONG NÓI TỰ NHIÊN: Sử dụng từ ngữ khẩu ngữ tự nhiên, tránh dịch word-by-word hoặc văn viết khô khan.{audio_tags_instruction}
 
 --- NGỮ CẢNH HỘI THOẠI ĐÃ DỊCH TRƯỚC ĐÓ (Dùng để tham khảo cách xưng hô và mạch truyện, KHÔNG dịch lại):
@@ -168,7 +198,8 @@ def _translate_batch(
     total_batches: int,
     history_context: list = None,
     future_context: list = None,
-    auto_audio_tags: bool = False
+    auto_audio_tags: bool = False,
+    translation_style: str = "standard"
 ) -> dict:
     """
     Translate a batch of segments. Returns dict of {id: translated_text}.
@@ -189,7 +220,8 @@ def _translate_batch(
                 source_language,
                 history_context=history_context,
                 future_context=future_context,
-                auto_audio_tags=auto_audio_tags
+                auto_audio_tags=auto_audio_tags,
+                translation_style=translation_style
             )
             reply = _translate_via_provider(prompt)
             parsed = _parse_translation_response(reply, expected_ids)
@@ -228,14 +260,26 @@ def _translate_batch(
             combined_history = (history_context or []) + completed_in_batch
             combined_history = combined_history[-4:]  # Limit context to last 4 items
             
-            single_result = _translate_single_segment(seg, source_language, history_context=combined_history, auto_audio_tags=auto_audio_tags)
+            single_result = _translate_single_segment(
+                seg,
+                source_language,
+                history_context=combined_history,
+                auto_audio_tags=auto_audio_tags,
+                translation_style=translation_style
+            )
             if single_result:
                 result[seg["id"]] = single_result
 
     return result
 
 
-def _translate_single_segment(segment: dict, source_language: str, history_context: list = None, auto_audio_tags: bool = False) -> str:
+def _translate_single_segment(
+    segment: dict,
+    source_language: str,
+    history_context: list = None,
+    auto_audio_tags: bool = False,
+    translation_style: str = "standard"
+) -> str:
     """Translate a single segment with context support. Returns translated text or None."""
     text = segment["text"].strip()
     if not text:
@@ -258,12 +302,16 @@ def _translate_single_segment(segment: dict, source_language: str, history_conte
         audio_tags_instruction = "\n4. THẺ CẢM XÚC: Hãy tự động chèn các thẻ cảm xúc tiếng Anh (ví dụ: [laughs], [sighs], [gasps], [angry], [crying], [whispers]) vào bản dịch tiếng Việt nếu ngữ cảnh đòi hỏi. Không lạm dụng."
         audio_tags_instruction_en = "\n4. EMOTIONAL AUDIO TAGS: You MAY insert emotional audio tags (e.g. [laughs], [sighs], [gasps], [angry], [crying], [whispers]) directly into the translated text if the context strongly implies that emotion."
 
-    simple_prompt = f"""Bạn là chuyên gia dịch thuật lồng tiếng và thuyết minh video chuyên nghiệp. Dịch câu được yêu cầu dưới đây sang tiếng Việt tự nhiên, đúng ngữ cảnh và giữ nguyên sắc thái biểu cảm.
+    style_instruction = _get_style_instructions(translation_style)
+
+    simple_prompt = f"""Bạn là chuyên gia dịch thuật lồng tiếng và thuyết minh video chuyên nghiệp. Dịch/chuyển thể câu được yêu cầu dưới đây sang tiếng Việt.
+
+{style_instruction}
 
 ĐẶC BIỆT LƯU Ý KHI DỊCH LỒNG TIẾNG:
-1. BẢO TOÀN SỰ NHẤN MẠNH VÀ LẶP TỪ: Nếu câu gốc lặp từ để nhấn mạnh cường độ hoặc cảm xúc (ví dụ: 'really really really long', 'very very slow', 'go go go'), bạn CẦN dịch lặp lại tương ứng trong tiếng Việt (ví dụ: 'rất rất rất dài', 'rất rất chậm', 'đi đi đi') thay vì dịch tóm gọn. Không được lược bỏ các từ biểu thị sắc thái cảm xúc hoặc mức độ.
-2. TƯƠNG ĐỒNG ĐỘ DÀI/NHỊP ĐIỆU: Đảm bảo độ dài và nhịp điệu của bản dịch tiếng Việt tương đương với câu gốc để người nói lồng tiếng có thể đọc khớp thời gian với video gốc. Tránh dịch quá ngắn gọn làm mất nhịp điệu.
-3. VĂN PHONG NÓI TỰ NHIÊN: Sử dụng từ ngữ khẩu ngữ tự nhiên, phù hợp để lồng tiếng nói.{audio_tags_instruction}
+1. BẢO TOÀN SỰ NHẤN MẠNH VÀ LẶP TỪ: Nếu câu gốc lặp từ để nhấn mạnh cường độ hoặc cảm xúc (ví dụ: 'really really really long', 'very very slow', 'go go go'), bạn CẦN dịch lặp lại tương ứng trong tiếng Việt.
+2. TƯƠNG ĐỒNG ĐỘ DÀI/NHỊP ĐIỆU: Đảm bảo độ dài và nhịp điệu tương đương với câu gốc.
+3. VĂN PHONG NÓI TỰ NHIÊN: Sử dụng từ ngữ khẩu ngữ tự nhiên.{audio_tags_instruction}
 
 --- NGỮ CẢNH CÁC CÂU ĐÃ NÓI TRƯỚC ĐÓ (Để tham khảo cách xưng hô):
 {history_str}
@@ -273,19 +321,21 @@ Câu gốc ({source_language}): {text}
 
 Yêu cầu:
 1. Chỉ trả về duy nhất bản dịch tiếng Việt của câu trên.
-2. KHÔNG giải thích, KHÔNG thêm bớt thông tin ngoài bản dịch.
+2. KHÔNG giải thích.
 3. Đảm bảo đại từ nhân xưng thống nhất với ngữ cảnh trước đó.
 """
 
     for attempt in range(2):
         try:
             if TRANSLATION_PROVIDER.lower() == "gemini":
-                gemini_prompt = f"""You are a professional video dubbing and voiceover translator. Translate the target text to Vietnamese naturally, keeping pronouns consistent with the context.
+                gemini_prompt = f"""You are a video dubbing and voiceover translator. Translate/adapt the target text to Vietnamese naturally, keeping pronouns consistent with the context.
+
+Style guidance: {translation_style} (If humorous, add short exclamations/funny comments for Fair Use reaction style while keeping text concise).
 
 CRITICAL REQUIREMENTS FOR DUBBING TRANSLATION:
-1. PRESERVE EMPHASIS & REPETITIONS: If the source text repeats words for emphasis (e.g. "really really really long", "very very slow", "go go go"), you MUST repeat them in Vietnamese (e.g. "rất rất rất dài", "rất rất chậm", "đi đi đi") to match the character's speaking length and emotional intensity. Do not summarize or shorten them.
-2. NATURAL SPOKEN STYLE: Use a natural, conversational spoken Vietnamese style suitable for voiceover recording, not dry written text.
-3. MATCH PACING: Keep the length/rhythm of the translation reasonably aligned with the source text.{audio_tags_instruction_en}
+1. PRESERVE EMPHASIS & REPETITIONS: If the source text repeats words for emphasis, repeat them in Vietnamese.
+2. NATURAL SPOKEN STYLE: Use natural conversational Vietnamese suitable for voiceover.
+3. MATCH PACING: Keep translation length reasonably aligned with source text.{audio_tags_instruction_en}
 
 Context of previous lines:
 {history_str}
@@ -333,7 +383,12 @@ Output only the translated text as a JSON string or JSON array with one element.
     return None
 
 
-def translate_segments(segments: list, source_language: str, auto_audio_tags: bool = False) -> list:
+def translate_segments(
+    segments: list,
+    source_language: str,
+    auto_audio_tags: bool = False,
+    translation_style: str = None
+) -> list:
     """
     Translates a list of transcription segments into Vietnamese.
     Uses batched approach: splits segments into batches of TRANSLATION_BATCH_SIZE,
@@ -345,6 +400,9 @@ def translate_segments(segments: list, source_language: str, auto_audio_tags: bo
     if not segments:
         return []
 
+    if not translation_style:
+        translation_style = TRANSLATION_STYLE or "standard"
+
     # If source is already Vietnamese, just copy text
     if source_language.lower() in ("vi", "vie", "vietnamese"):
         print("[Module 3] Source language is Vietnamese, skipping translation.")
@@ -353,7 +411,7 @@ def translate_segments(segments: list, source_language: str, auto_audio_tags: bo
         return segments
 
     print(f"[Module 3] Translating {len(segments)} segments from {source_language} to Vietnamese...")
-    print(f"[Module 3] Provider: {TRANSLATION_PROVIDER}, Batch size: {TRANSLATION_BATCH_SIZE}")
+    print(f"[Module 3] Provider: {TRANSLATION_PROVIDER}, Style: {translation_style}, Batch size: {TRANSLATION_BATCH_SIZE}")
 
     # Split into batches
     batches = []
@@ -400,7 +458,8 @@ def translate_segments(segments: list, source_language: str, auto_audio_tags: bo
             len(batches),
             history_context=history_context,
             future_context=future_context,
-            auto_audio_tags=auto_audio_tags
+            auto_audio_tags=auto_audio_tags,
+            translation_style=translation_style
         )
         all_translations.update(batch_result)
 

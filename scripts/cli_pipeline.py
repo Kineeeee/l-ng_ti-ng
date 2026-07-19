@@ -14,6 +14,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from backend.app.config import (
     LM_STUDIO_BASE_URL,
     TRANSLATION_PROVIDER,
+    TRANSLATION_STYLE,
     MASK_OLD_SUBS,
     MASK_SUB_Y_RATIO,
     MASK_SUB_COLOR,
@@ -365,6 +366,9 @@ def main():
     parser.add_argument("-i", "--interactive", action="store_true", help="Enable interactive verification at critical stages (Transcribe, Translate, Subtitle)")
     parser.add_argument("--manual-translate", action="store_true", help="Manually translate segments instead of using LLM machine translation")
     parser.add_argument("--auto-audio-tags", action="store_true", help="Auto insert emotional audio tags during translation (optimized for ElevenLabs)")
+    parser.add_argument("--translation-style", "--style", dest="translation_style", default=TRANSLATION_STYLE,
+                        choices=["standard", "humorous", "storyteller"],
+                        help="Phong cách dịch thuật: 'standard'=Thuyết minh chuẩn | 'humorous'=Hài hước/Bình luận Fair Use | 'storyteller'=Giật tít kịch tính TikTok")
     parser.add_argument("--skip-summarize", action="store_true", help="Skip summarizing video content and generating recommended titles")
     
     parser.add_argument("--lang", default="auto", help="Source language (e.g., en, zh, auto)")
@@ -416,12 +420,19 @@ def main():
         ),
     )
     
-    # TTS backend selection
+    # OCR hardsub subtitle arguments
+    parser.add_argument("--no-ocr", action="store_true", help="Disable Video OCR hardsub subtitle extraction")
+    
+    # TTS engine selection
     parser.add_argument("--tts-engine", default=None, choices=["edge-tts", "gemini", "elevenlabs"], help="TTS Engine (overrides .env TTS_ENGINE)")
     parser.add_argument("--tts-voice", default=None, help="TTS Voice (overrides .env default voices)")
     
     args = parser.parse_args()
     
+    if args.no_ocr:
+        import backend.app.config
+        backend.app.config.ENABLE_OCR_SUBTITLE = False
+
     print("="*50)
     print(" AutoDub VN - CLI Pipeline Started ")
     print("="*50)
@@ -561,7 +572,7 @@ def main():
             print("\n--- [Step 2] Transcribe ---")
             t0 = time.time()
             lang_hint = None if args.lang == "auto" else args.lang
-            segments = transcribe_audio(audio_path, language_hint=lang_hint, device_override=args.transcribe_device)
+            segments = transcribe_audio(audio_path, language_hint=lang_hint, device_override=args.transcribe_device, video_path=video_path)
             
             if not segments:
                 print("No speech detected. Exiting.")
@@ -644,7 +655,12 @@ def main():
                         continue
             else:
                 auto_tags = args.auto_audio_tags or (args.tts_engine == "elevenlabs" or TTS_ENGINE == "elevenlabs")
-                segments = translate_segments(segments, detected_lang, auto_audio_tags=auto_tags)
+                segments = translate_segments(
+                    segments,
+                    detected_lang,
+                    auto_audio_tags=auto_tags,
+                    translation_style=args.translation_style
+                )
             timings["3_Translate"] = time.time() - t0
             
             # Save standard translation checkpoint (useful if resuming from next steps like TTS)

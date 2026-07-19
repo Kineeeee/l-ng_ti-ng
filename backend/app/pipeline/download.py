@@ -5,6 +5,7 @@ import uuid
 import time
 import re
 import urllib.request
+from backend.app.config import VIDEO_SPEED_FACTOR
 
 def resolve_redirects(url: str) -> str:
     try:
@@ -311,23 +312,25 @@ def download_video(video_url: str, output_dir: str = "output", job_id: str = Non
     t_download = time.time() - t0
     print(f"[Module 1] Video downloaded in {t_download:.1f}s")
 
-    print(f"[Module 1] Adjusting video speed to 0.8x...")
+    speed_factor = VIDEO_SPEED_FACTOR
+    pts_factor = 1.0 / speed_factor
+    print(f"[Module 1] Adjusting video speed to {speed_factor:.2f}x...")
     t_speed = time.time()
     slow_video_path = f"{base_path}_slow.mp4"
     speed_command = [
         "ffmpeg", "-y",
         "-threads", "0",
         "-i", actual_video_path,
-        "-filter:v", "setpts=1.25*PTS",
-        "-filter:a", "atempo=0.8",
+        "-filter:v", f"setpts={pts_factor:.5f}*PTS",
+        "-filter:a", f"atempo={speed_factor:.5f}",
         slow_video_path
     ]
     try:
         subprocess.run(speed_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         os.remove(actual_video_path)
         os.rename(slow_video_path, actual_video_path)
-        duration = float(duration) / 0.8
-        print(f"[Module 1] Video speed adjusted in {time.time() - t_speed:.1f}s")
+        duration = float(duration) / speed_factor
+        print(f"[Module 1] Video speed adjusted to {speed_factor:.2f}x in {time.time() - t_speed:.1f}s")
     except Exception as e:
         print(f"[Warning] Failed to adjust video speed: {e}")
         if os.path.exists(slow_video_path):

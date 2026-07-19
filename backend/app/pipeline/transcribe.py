@@ -10,6 +10,7 @@ from backend.app.config import (
     WHISPER_CPU_THREADS,
     WHISPER_DEVICE,
     GROQ_API_KEY,
+    ENABLE_OCR_SUBTITLE,
 )
 
 # Module-level model cache to avoid reloading on repeated calls
@@ -526,9 +527,9 @@ def _transcribe_with_groq(audio_path: str, language_hint: str = None) -> list:
 # Public entry point
 # ─────────────────────────────────────────────
 
-def transcribe_audio(audio_path: str, language_hint: str = None, device_override: str = None) -> list:
+def transcribe_audio(audio_path: str, language_hint: str = None, device_override: str = None, video_path: str = None) -> list:
     """
-    Transcribes audio using the configured backend.
+    Transcribes audio using the configured backend, and optionally fuses OCR hardsub subtitles.
 
     device_override (optional) — override backend for this single call:
         'auto'  → auto-detect (mlx if Apple Silicon, else cpu)
@@ -539,6 +540,7 @@ def transcribe_audio(audio_path: str, language_hint: str = None, device_override
     Config (via .env):
         WHISPER_DEVICE=auto|mlx|cpu|groq
         GROQ_API_KEY=gsk_...  (required for groq backend)
+        ENABLE_OCR_SUBTITLE=True|False
 
     Returns a list of segment dicts: { id, start, end, text, detected_language }
     """
@@ -556,16 +558,29 @@ def transcribe_audio(audio_path: str, language_hint: str = None, device_override
 
     if device == "mlx":
         try:
-            return _transcribe_with_mlx(audio_path, language_hint)
+            stt_segments = _transcribe_with_mlx(audio_path, language_hint)
         except Exception as e:
             print(f"[Module 2] WARNING: MLX transcription failed ({e}). Falling back to CPU...")
-            return _transcribe_with_cpu(audio_path, language_hint)
+            stt_segments = _transcribe_with_cpu(audio_path, language_hint)
 
     elif device == "groq":
-        return _transcribe_with_groq(audio_path, language_hint)
+        stt_segments = _transcribe_with_groq(audio_path, language_hint)
 
     else:  # 'cpu' or unknown → safer default
-        return _transcribe_with_cpu(audio_path, language_hint)
+        stt_segments = _transcribe_with_cpu(audio_path, language_hint)
+
+    # Perform Video OCR Subtitle Fusion if video_path is available
+    if ENABLE_OCR_SUBTITLE and video_path and os.path.exists(video_path):
+        try:
+            from backend.app.pipeline.ocr_subtitle import extract_subtitles_from_video, merge_stt_and_ocr_segments
+            ocr_segs = extract_subtitles_from_video(video_path)
+            if ocr_segs:
+                fused_segments, stats = merge_stt_and_ocr_segments(stt_segments, ocr_segs)
+                return fused_segments
+        except Exception as e:
+            print(f"[Module 2] WARNING: OCR subtitle extraction/fusion failed ({e}). Continuing with STT segments.")
+
+    return stt_segments
 
 
 if __name__ == "__main__":

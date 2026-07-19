@@ -154,6 +154,69 @@ def _extract_mean_pitch_librosa(wav_path: str, start_sec: float = 0.0, end_sec: 
     return float(np.median(voiced_f0))
 
 
+def _pitch_shift_clean(input_wav: str, output_wav: str, n_steps: float) -> bool:
+    """
+    Pitch shift âm thanh sạch, TRIỆT ĐỂ LOẠI BỎ HỆU ỨNG VANG (Phase Smearing / Reverb).
+
+    Thứ tự ưu tiên:
+    1. FFmpeg rubberband filter với pitchq=quality & formant=preserved
+    2. FFmpeg asetrate + atempo (Resampling method — 100% không dính vang STFT)
+    3. Librosa pitch_shift fallback
+    """
+    if abs(n_steps) < 0.1:
+        import shutil
+        if input_wav != output_wav:
+            shutil.copy2(input_wav, output_wav)
+        return True
+
+    pitch_ratio = 2.0 ** (n_steps / 12.0)
+
+    # 1. FFmpeg rubberband filter (Thuật toán chuyên nghiệp — Giữ nguyên formant, không bị vang)
+    cmd_rubberband = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", input_wav,
+        "-af", f"rubberband=pitch={pitch_ratio:.6f}:pitchq=quality:formant=preserved",
+        output_wav
+    ]
+    try:
+        res = subprocess.run(cmd_rubberband, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 100:
+            return True
+    except Exception:
+        pass
+
+    # 2. Resampling method qua FFmpeg (asetrate + atempo — 100% Không vang phase vocoder)
+    try:
+        tempo_ratio = 1.0 / pitch_ratio
+        sr = 24000
+        try:
+            with wave.open(input_wav, "rb") as wf:
+                sr = wf.getframerate()
+        except Exception:
+            pass
+
+        target_rate = int(sr * pitch_ratio)
+        af_filter = f"asetrate={target_rate},aresample={sr},atempo={tempo_ratio:.6f}"
+        cmd_resample = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", input_wav,
+            "-af", af_filter,
+            output_wav
+        ]
+        res = subprocess.run(cmd_resample, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 100:
+            return True
+    except Exception:
+        pass
+
+    # 3. Fallback: Librosa
+    librosa = _import_librosa()
+    y, sr = _load_mono_float32(input_wav, sr=ANALYSIS_SR)
+    y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
+    _save_float32_to_wav(y_shifted, sr, output_wav)
+    return True
+
+
 def apply_pitch_shift(
     tts_wav_path: str,
     orig_wav_path: str,
@@ -179,8 +242,6 @@ def apply_pitch_shift(
     Returns:
         True nếu thành công, False nếu thất bại (caller dùng TTS gốc).
     """
-    librosa = _import_librosa()
-
     try:
         # 1. Lấy pitch trung bình gốc
         orig_f0 = _extract_mean_pitch_librosa(orig_wav_path, orig_start_sec, orig_end_sec)
@@ -207,16 +268,13 @@ def apply_pitch_shift(
             shutil.copy2(tts_wav_path, output_path)
             return True
 
-        # 5. Load TTS audio và shift
-        y, sr = _load_mono_float32(tts_wav_path, sr=ANALYSIS_SR)
-        y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=delta_semitones)
+        # 5. Shift bằng thuật toán Rubberband sạch tiếng (không vang)
+        ok = _pitch_shift_clean(tts_wav_path, output_path, delta_semitones)
 
-        # 6. Lưu kết quả
-        _save_float32_to_wav(y_shifted, sr, output_path)
-
-        print(f"           [Pitch-Shift] Orig={orig_f0:.1f}Hz TTS={tts_f0:.1f}Hz "
-              f"Δ={delta_semitones:+.1f} semitones → {os.path.basename(output_path)}")
-        return True
+        if ok:
+            print(f"           [Pitch-Shift] Orig={orig_f0:.1f}Hz TTS={tts_f0:.1f}Hz "
+                  f"Δ={delta_semitones:+.1f} semitones → {os.path.basename(output_path)}")
+        return ok
 
     except Exception as e:
         print(f"           [Pitch-Shift] ⚠ Lỗi: {e}. Dùng TTS gốc.")
@@ -417,15 +475,13 @@ def apply_hoat_ngon_pitch_shift(
     """
     Phương án 3: Biến đổi giọng TTS theo phong cách 'Cô gái hoạt ngôn' (CapCut style).
     Đẩy cao độ (pitch) lên ~+3.5 semitones để tạo tông giọng tươi trẻ, nhanh nhẹn và hoạt ngôn.
-    Không phụ thuộc vào file âm thanh gốc.
+    Không phụ thuộc vào file âm thanh gốc. Sử dụng FFmpeg rubberband để triệt để loại bỏ tiếng vang.
     """
-    librosa = _import_librosa()
     try:
-        y, sr = _load_mono_float32(tts_wav_path, sr=ANALYSIS_SR)
-        y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
-        _save_float32_to_wav(y_shifted, sr, output_path)
-        print(f"           [Hoạt-Ngôn] Shift +{n_steps:.1f} semitones → {os.path.basename(output_path)}")
-        return True
+        ok = _pitch_shift_clean(tts_wav_path, output_path, n_steps=n_steps)
+        if ok:
+            print(f"           [Hoạt-Ngôn] Shift +{n_steps:.1f} semitones → {os.path.basename(output_path)}")
+        return ok
     except Exception as e:
         print(f"           [Hoạt-Ngôn] ⚠ Lỗi: {e}. Dùng TTS gốc.")
         import shutil
