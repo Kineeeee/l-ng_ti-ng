@@ -1,7 +1,6 @@
 import os
 import time
 import subprocess
-import wave
 from pydub import AudioSegment
 from backend.app.config import (
     TTS_DYNAMIC_SPEEDUP,
@@ -12,7 +11,6 @@ from backend.app.config import (
     AUDIO_SYNC_OFFSET_MS
 )
 from backend.app.pipeline.audio_utils import (
-    get_wav_duration_fast as _get_wav_duration_fast,
     trim_silence as _trim_silence,
 )
 
@@ -55,6 +53,81 @@ def merge_intervals(intervals: list, gap_threshold_ms: int = 800) -> list:
     return merged
 
 
+def resolve_voice_collisions(processed_segments: list, min_gap_ms: int = 40) -> tuple:
+    """
+    STRICT NON-OVERLAPPING ALIGNMENT:
+    Guarantees that consecutive TTS voice segments NEVER overlap with each other.
+    
+    1. If segment N is too long and collides with segment N+1, speeds up segment N using FFmpeg atempo.
+    2. If segment N still touches segment N+1, slides segment N+1 forward so there is at least min_gap_ms gap.
+    
+    Returns:
+        tuple: (resolved_segments: list, speedup_count: int, collision_resolved_count: int)
+    """
+    if not processed_segments:
+        return [], 0, 0
+
+    processed_segments.sort(key=lambda x: x["start_ms"])
+    
+    speedup_count = 0
+    collision_resolved_count = 0
+    prev_end_ms = 0
+
+    for i in range(len(processed_segments)):
+        seg = processed_segments[i]
+        
+        # A. Ensure segment does not overlap with PREVIOUS segment
+        if seg["start_ms"] < prev_end_ms + min_gap_ms:
+            seg["start_ms"] = prev_end_ms + min_gap_ms
+            collision_resolved_count += 1
+            
+        dur_ms = len(seg["audio"])
+        
+        # B. Check available gap before NEXT segment
+        if i < len(processed_segments) - 1:
+            next_start_ms = processed_segments[i + 1]["start_ms"]
+            available_ms = next_start_ms - seg["start_ms"] - min_gap_ms
+            
+            # Perform speedup if the current audio duration exceeds available gap
+            if TTS_DYNAMIC_SPEEDUP and available_ms > 200 and dur_ms > available_ms:
+                speed_ratio = dur_ms / available_ms
+                speed_ratio = min(speed_ratio, 1.45)  # Cap speedup ratio at 1.45x
+                
+                if speed_ratio > 1.05:
+                    wav_path = seg.get("wav_path", "")
+                    sped_up = False
+                    if wav_path and os.path.exists(wav_path):
+                        sped_up_path = wav_path.replace(".wav", "_fast.wav")
+                        if _speed_up_with_ffmpeg(wav_path, sped_up_path, speed_ratio):
+                            new_audio = AudioSegment.from_file(sped_up_path)
+                            new_audio = new_audio.set_frame_rate(DUBBED_SAMPLE_RATE).set_channels(1)
+                            new_audio = _trim_silence(new_audio)
+                            if seg.get("tts_volume_db", 0.0) != 0.0:
+                                new_audio = new_audio + seg["tts_volume_db"]
+                            seg["audio"] = new_audio
+                            try: os.remove(sped_up_path)
+                            except OSError: pass
+                            sped_up = True
+                            speedup_count += 1
+                    
+                    if not sped_up:
+                        seg["audio"] = seg["audio"].speedup(playback_speed=speed_ratio, chunk_size=50, crossfade=25)
+                        speedup_count += 1
+                    
+                    dur_ms = len(seg["audio"])
+
+        # C. Double check: if audio still extends past next segment start, push next segment start forward
+        if i < len(processed_segments) - 1:
+            next_start = processed_segments[i + 1]["start_ms"]
+            if seg["start_ms"] + dur_ms > next_start - min_gap_ms:
+                processed_segments[i + 1]["start_ms"] = seg["start_ms"] + dur_ms + min_gap_ms
+                collision_resolved_count += 1
+
+        prev_end_ms = seg["start_ms"] + dur_ms
+
+    return processed_segments, speedup_count, collision_resolved_count
+
+
 def align_and_merge_audio(
     segments: list, 
     video_duration_sec: float, 
@@ -68,8 +141,8 @@ def align_and_merge_audio(
     sync_offset_ms: float = AUDIO_SYNC_OFFSET_MS
 ) -> str:
     """
-    Aligns TTS audio segments to the original timestamps and merges them into a single track,
-    optionally mixing in the original background audio with ducking transitions.
+    Aligns TTS audio segments to original timestamps and merges them into a single track.
+    STRICT NON-OVERLAPPING GUARANTEE: Ensures consecutive TTS voice lines NEVER overlap.
     
     Returns the path to the merged dubbed audio WAV file.
     """
@@ -78,9 +151,8 @@ def align_and_merge_audio(
     
     total_ms = int(video_duration_sec * 1000)
     
-    # 1. Pre-process and trim all speech segments first, adjusting their speed and volume
-    processed_segments = []
-    speedup_count = 0
+    # 1. Pre-process and trim all speech segments first
+    raw_segments = []
     
     for segment in segments:
         if not segment.get("tts_audio_path") or not os.path.exists(segment["tts_audio_path"]):
@@ -88,7 +160,6 @@ def align_and_merge_audio(
             
         start_ms = int(segment["start"] * 1000)
         end_ms = int(segment["end"] * 1000)
-        target_duration_ms = end_ms - start_ms
         
         wav_path = segment["tts_audio_path"]
         segment_audio = AudioSegment.from_file(wav_path)
@@ -105,53 +176,27 @@ def align_and_merge_audio(
         if tts_volume_db != 0.0:
             segment_audio = segment_audio + tts_volume_db
             
-        tts_duration_ms = len(segment_audio)
-        
-        # Perform dynamic speed up if the clip is too long for its slot
-        if TTS_DYNAMIC_SPEEDUP and target_duration_ms > 0 and tts_duration_ms > target_duration_ms * 1.15:
-            speed_ratio = tts_duration_ms / target_duration_ms
-            speed_ratio = min(speed_ratio, 1.3)
-            
-            if speed_ratio > 1.05:
-                # Use high-quality FFmpeg speed up
-                sped_up_path = wav_path.replace(".wav", "_fast.wav")
-                if _speed_up_with_ffmpeg(wav_path, sped_up_path, speed_ratio):
-                    segment_audio = AudioSegment.from_file(sped_up_path)
-                    segment_audio = segment_audio.set_frame_rate(DUBBED_SAMPLE_RATE).set_channels(1)
-                    segment_audio = _trim_silence(segment_audio)
-                    if tts_volume_db != 0.0:
-                        segment_audio = segment_audio + tts_volume_db
-                    tts_duration_ms = len(segment_audio)
-                    
-                    try:
-                        os.remove(sped_up_path)
-                    except OSError:
-                        pass
-                    speedup_count += 1
-                else:
-                    # Fallback to Pydub speedup
-                    segment_audio = segment_audio.speedup(playback_speed=speed_ratio, chunk_size=50, crossfade=25)
-                    tts_duration_ms = len(segment_audio)
-                    speedup_count += 1
-                    
-        processed_segments.append({
+        raw_segments.append({
+            "id": segment.get("id"),
             "audio": segment_audio,
             "start_ms": start_ms,
-            "duration_ms": tts_duration_ms
+            "end_ms": end_ms,
+            "wav_path": wav_path,
+            "tts_volume_db": tts_volume_db
         })
         
-    # 2. Build the list of original speech intervals based on the original segment start/end times
+    # 2. Strict non-overlapping collision resolution
+    processed_segments, speedup_count, collisions_resolved = resolve_voice_collisions(raw_segments, min_gap_ms=40)
+    
+    # 3. Build speech intervals for audio ducking using non-overlapping positions
     speech_intervals = []
-    for segment in segments:
-        if not segment.get("tts_audio_path") or not os.path.exists(segment["tts_audio_path"]):
-            continue
-        start_ms = int(segment["start"] * 1000)
-        end_ms = int(segment["end"] * 1000)
-        if start_ms >= end_ms:
-            continue
-        speech_intervals.append((start_ms, end_ms))
+    for seg in processed_segments:
+        s_start = seg["start_ms"]
+        s_end = s_start + len(seg["audio"])
+        if s_start < s_end:
+            speech_intervals.append((s_start, s_end))
         
-    # 3. Initialize background audio and apply ducking
+    # 4. Initialize background audio and apply ducking
     mixed_bg_audio = None
     
     if mix_original_audio and original_audio_path and os.path.exists(original_audio_path):
@@ -163,11 +208,9 @@ def align_and_merge_audio(
             if original_volume_db != 0.0:
                 original_audio = original_audio + original_volume_db
                 
-            # Merge intervals using the generic helper
             merged_intervals = merge_intervals(speech_intervals, gap_threshold_ms=800)
             print(f"           Applying audio ducking ({duck_volume_db}dB) across {len(merged_intervals)} regions")
             
-            # Slice-based ducking to prevent relative gain accumulation
             ducked_audio = AudioSegment.silent(duration=0, frame_rate=DUBBED_SAMPLE_RATE)
             if original_audio.channels > 1:
                 ducked_audio = ducked_audio.set_channels(original_audio.channels)
@@ -179,33 +222,27 @@ def align_and_merge_audio(
             total_len = len(original_audio)
             
             for start_ms, end_ms in merged_intervals:
-                # Apply sync offset to the ducking window so it matches the voice timing
                 shifted_start = max(0, start_ms + int(sync_offset_ms))
                 shifted_end = max(0, end_ms + int(sync_offset_ms))
                 
-                # Cap boundaries to total duration
                 shifted_start = min(total_len, shifted_start)
                 shifted_end = min(total_len, shifted_end)
                 
                 s_start = max(curr_ms, shifted_start - fade_ms)
                 s_end = min(total_len, shifted_end + fade_ms)
                 
-                # A. Segment before ducking transition (0dB)
                 if s_start > curr_ms:
                     ducked_audio += original_audio[curr_ms:s_start]
                     
-                # B. Fade down transition (0dB -> duck_volume_db)
                 if shifted_start > s_start:
                     fade_down_part = original_audio[s_start:shifted_start]
                     fade_down_part = fade_down_part.fade(to_gain=duck_volume_db, start=0, duration=shifted_start - s_start)
                     ducked_audio += fade_down_part
                     
-                # C. Ducked speech region (constant duck_volume_db)
                 if shifted_end > shifted_start:
                     speech_part = original_audio[shifted_start:shifted_end] + duck_volume_db
                     ducked_audio += speech_part
                     
-                # D. Fade up transition (duck_volume_db -> 0dB)
                 if s_end > shifted_end:
                     fade_up_part = original_audio[shifted_end:s_end] + duck_volume_db
                     fade_up_part = fade_up_part.fade(to_gain=-duck_volume_db, start=0, duration=s_end - shifted_end)
@@ -213,7 +250,6 @@ def align_and_merge_audio(
                     
                 curr_ms = s_end
                 
-            # E. Append remaining audio at the end of the video (0dB)
             if curr_ms < total_len:
                 ducked_audio += original_audio[curr_ms:]
                 
@@ -225,7 +261,7 @@ def align_and_merge_audio(
         mixed_bg_audio = AudioSegment.silent(duration=total_ms, frame_rate=DUBBED_SAMPLE_RATE)
         mixed_bg_audio = mixed_bg_audio.set_channels(1)
         
-    # 4. Overlay the processed dubbed voices onto the background at shifted timestamps
+    # 5. Overlay non-overlapping dubbed voice segments
     for seg in processed_segments:
         segment_audio = seg["audio"]
         shifted_start_ms = max(0, seg["start_ms"] + int(sync_offset_ms))
@@ -236,8 +272,8 @@ def align_and_merge_audio(
     
     elapsed = time.time() - t0
     file_size_mb = os.path.getsize(dubbed_audio_path) / (1024 * 1024)
-    print(f"[Module 5] Merged audio saved to {dubbed_audio_path}")
-    print(f"           {len(processed_segments)} segments, {speedup_count} sped up, {file_size_mb:.1f}MB, {elapsed:.1f}s")
+    print(f"[Module 5] 🔒 Strict Non-Overlapping Alignment: Merged audio saved to {dubbed_audio_path}")
+    print(f"           {len(processed_segments)} segments (0 overlaps guaranteed), {speedup_count} sped up, {collisions_resolved} gaps resolved, {file_size_mb:.1f}MB, {elapsed:.1f}s")
     return dubbed_audio_path
 
 

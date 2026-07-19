@@ -243,42 +243,36 @@ def generate_manual_translation_markdown(output_dir: str, job_id: str, segments:
         print(f"[Manual Translation] Markdown file already exists at: {md_path}")
         return
         
+    lang_display = source_lang.upper() if source_lang else "NGOẠI NGỮ"
+
     lines = [
-        "# AutoDub VN - Manual Translation File",
-        f"# Job ID: {job_id}",
-        f"# Source Language: {source_lang}",
+        f"# PROMPT CHO AI DỊCH THUẬT LỒNG TIẾNG (Job ID: {job_id})",
+        "# 📋 HƯỚNG DẪN BẰNG BƯỚC:",
+        "# 1. Mở file này, chọn tất cả (Cmd+A hoặc Ctrl+A) -> Copy (Cmd+C).",
+        "# 2. Dán (Paste) vào ChatGPT / Claude / DeepSeek / Gemini Web.",
+        "# 3. Copy toàn bộ câu trả lời bản dịch của AI dán đè vào file này -> Lưu file -> Nhấn Enter trên màn hình CLI.",
         "",
-        "Hãy dịch các đoạn hội thoại dưới đây sang tiếng Việt.",
-        "Điền bản dịch của bạn ngay sau dòng \"Translate: \".",
-        "Hãy giữ nguyên tiêu đề \"## Segment <ID>\" và các mốc thời gian.",
-        ""
+        f"Bạn là chuyên gia dịch thuật lồng tiếng video. Hãy dịch các câu dưới đây từ tiếng {lang_display} sang tiếng Việt với văn phong nói tự nhiên, diễn cảm, súc tích (phù hợp để lồng tiếng nói).",
+        "",
+        "QUY TẮC BẮT BUỘC KHI TRẢ VỀ KẾT QUẢ:",
+        "1. Giữ nguyên chỉ số ID dạng [1], [2], [3]... ở đầu mỗi câu.",
+        "2. Định dạng trả về duy nhất: [ID] Bản dịch tiếng Việt.",
+        "3. KHÔNG thêm bất kỳ lời giải thích, chào hỏi hay văn bản dư thừa nào khác.",
+        "",
+        "--- CÁC CÂU CẦN DỊCH ---"
     ]
     
     for seg in segments:
-        start_min = int(seg['start'] // 60)
-        start_sec = seg['start'] % 60
-        end_min = int(seg['end'] // 60)
-        end_sec = seg['end'] % 60
-        
-        time_str = f"{start_min:02d}:{start_sec:05.2f} -> {end_min:02d}:{end_sec:05.2f}"
-        
-        existing_trans = seg.get("translated_text", "").strip()
-        trans_val = existing_trans if existing_trans else "[Điền bản dịch của bạn vào đây]"
-        
-        lines.extend([
-            "---",
-            f"## Segment {seg['id']} [{time_str}]",
-            f"Original: {seg.get('text', '').strip()}",
-            f"Translate: {trans_val}",
-            ""
-        ])
+        text = seg.get("text", "").strip()
+        lines.append(f"[{seg['id']}] {text}")
         
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
         
-    print(f"[Manual Translation] Created Markdown translation template at: {md_path}")
+    print(f"[Manual Translation] 📄 Created ultra-compact AI prompt template at: {md_path}")
 
 def parse_manual_translation_markdown(output_dir: str, job_id: str) -> dict:
+    import re
     job_dir = get_job_dir(output_dir, job_id)
     md_path = os.path.join(job_dir, "manual_translation.md")
     
@@ -291,18 +285,39 @@ def parse_manual_translation_markdown(output_dir: str, job_id: str) -> dict:
     with open(md_path, "r", encoding="utf-8") as f:
         for line in f:
             line_str = line.strip()
-            if line_str.startswith("## Segment"):
-                parts = line_str.split()
-                if len(parts) >= 3:
-                    try:
-                        current_seg_id = int(parts[2])
-                    except ValueError:
-                        current_seg_id = None
-            elif line_str.startswith("Translate:") and current_seg_id is not None:
-                val = line[len("Translate:"):].strip()
-                if "[Điền bản dịch" in val or "[Dịch câu này" in val:
-                    val = ""
-                translations[current_seg_id] = val
+            if not line_str or line_str.startswith("#") or line_str.startswith("---"):
+                # Support legacy header parsing format: ## Segment <ID>
+                if line_str.startswith("## Segment"):
+                    parts = line_str.split()
+                    if len(parts) >= 3:
+                        try: current_seg_id = int(parts[2])
+                        except ValueError: current_seg_id = None
+                continue
+            
+            # Format 1: [1] Bản dịch tiếng Việt...
+            m1 = re.match(r'^\[(\d+)\]\s*(.*)', line_str)
+            if m1:
+                translations[int(m1.group(1))] = m1.group(2).strip()
+                continue
+
+            # Format 2: 1 | Bản dịch tiếng Việt...
+            m2 = re.match(r'^(\d+)\s*\|\s*(.*)', line_str)
+            if m2:
+                translations[int(m2.group(1))] = m2.group(2).strip()
+                continue
+
+            # Format 3: 1. Bản dịch... or 1) Bản dịch...
+            m3 = re.match(r'^(\d+)[\.\)]\s*(.*)', line_str)
+            if m3:
+                translations[int(m3.group(1))] = m3.group(2).strip()
+                continue
+
+            # Format 4: Legacy Translate: Bản dịch...
+            if line_str.startswith("Translate:") and current_seg_id is not None:
+                val = line_str[len("Translate:"):].strip()
+                if "[Điền bản dịch" not in val:
+                    translations[current_seg_id] = val
+                continue
                 
     return translations
 
@@ -655,12 +670,22 @@ def main():
                         continue
             else:
                 auto_tags = args.auto_audio_tags or (args.tts_engine == "elevenlabs" or TTS_ENGINE == "elevenlabs")
-                segments = translate_segments(
-                    segments,
-                    detected_lang,
-                    auto_audio_tags=auto_tags,
-                    translation_style=args.translation_style
-                )
+                try:
+                    segments = translate_segments(
+                        segments,
+                        detected_lang,
+                        auto_audio_tags=auto_tags,
+                        translation_style=args.translation_style
+                    )
+                except Exception as trans_err:
+                    print("\n" + "="*65)
+                    print(f"⚠️ [CẢNH BÁO DỊCH THUẬT] API Dịch thuật gặp lỗi / đạt giới hạn Quota Rate Limit:")
+                    print(f"   {trans_err}")
+                    print("👉 TỰ ĐỘNG CHUYỂN SANG CHẾ ĐỘ DỊCH THỦ CÔNG (MANUAL TRANSLATION)")
+                    print("   Hệ thống sẽ tạo file template manual_translation.md để bạn điền bản dịch.")
+                    print("="*65 + "\n")
+                    args.manual_translate = True
+                    continue
             timings["3_Translate"] = time.time() - t0
             
             # Save standard translation checkpoint (useful if resuming from next steps like TTS)

@@ -98,11 +98,16 @@ Yêu cầu bắt buộc:
 
 
 
-def _call_gemini(prompt: str, max_retries: int = 5) -> str:
-    """Call Gemini API with retries."""
+class TranslationRateLimitError(Exception):
+    """Raised when the translation provider hits rate limit or quota exceeded."""
+    pass
+
+
+def _call_gemini(prompt: str, max_retries: int = 4) -> str:
+    """Call Gemini API with retries and rate limit detection."""
     if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
         raise ValueError(
-            "GEMINI_API_KEY is not set in .env. "
+            "GEMINI_API_KEY belum diatur dalam .env. "
             "Vui lòng lấy API Key từ https://aistudio.google.com/app/apikey và cập nhật vào file .env"
         )
 
@@ -122,9 +127,17 @@ def _call_gemini(prompt: str, max_retries: int = 5) -> str:
             )
             return response.text.strip()
         except Exception as e:
-            if attempt < max_retries - 1 and ("503" in str(e) or "429" in str(e)):
-                wait = 5 * (attempt + 1)
-                print(f"[Module 3]   ⟳ Gemini API busy. Retrying in {wait}s (Attempt {attempt + 1}/{max_retries})...")
+            err_str = str(e).lower()
+            if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
+                if attempt < max_retries - 1:
+                    wait = 4 * (attempt + 1)
+                    print(f"[Module 3]   ⟳ Gemini API Rate Limit (429/Quota Exceeded). Retrying in {wait}s ({attempt + 1}/{max_retries})...")
+                    time.sleep(wait)
+                else:
+                    raise TranslationRateLimitError(f"Gemini API Quota Exceeded / Rate Limit (429): {e}")
+            elif attempt < max_retries - 1 and ("503" in err_str or "busy" in err_str):
+                wait = 3 * (attempt + 1)
+                print(f"[Module 3]   ⟳ Gemini API busy. Retrying in {wait}s ({attempt + 1}/{max_retries})...")
                 time.sleep(wait)
             else:
                 raise
@@ -232,6 +245,9 @@ def _translate_batch(
                 if len(result) < len(expected_ids):
                     print(f"[Module 3]   ⚠ Batch {batch_num}/{total_batches}: got {len(result)}/{len(expected_ids)} translations")
                 break
+        except TranslationRateLimitError as rle:
+            print(f"[Module 3] ⚠️ Rate limit / Quota reached during batch: {rle}")
+            raise rle
         except Exception as e:
             print(f"[Module 3]   ⟳ Batch {batch_num}/{total_batches} attempt {attempt + 1}/3 failed: {e}")
             if attempt < 2:

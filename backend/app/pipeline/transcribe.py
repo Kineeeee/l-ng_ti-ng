@@ -573,7 +573,7 @@ def transcribe_audio(audio_path: str, language_hint: str = None, device_override
     if ENABLE_OCR_SUBTITLE and video_path and os.path.exists(video_path):
         try:
             from backend.app.pipeline.ocr_subtitle import extract_subtitles_from_video, merge_stt_and_ocr_segments
-            ocr_segs = extract_subtitles_from_video(video_path)
+            ocr_segs = extract_subtitles_from_video(video_path, stt_segments=stt_segments)
             if ocr_segs:
                 fused_segments, stats = merge_stt_and_ocr_segments(stt_segments, ocr_segs)
                 return fused_segments
