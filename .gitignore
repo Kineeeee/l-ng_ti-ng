@@ -25,4 +25,5 @@ Thumbs.db
 
 # Cookies (sensitive)
 cookies.txt
+cookies.txt.mtime
 *.json
