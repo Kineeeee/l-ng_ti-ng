@@ -367,6 +367,16 @@ async def _generate_tts_all_segments(segments: list, output_dir: str, engine: st
     segment_map = {}  # segment_id -> segment dict
 
     for idx, segment in enumerate(segments):
+        # CRITICAL USER REQUIREMENT: OCR hardsub segments (on-screen text notes) are translated for SUBTITLE display ONLY.
+        # They MUST NOT be spoken by TTS voiceover!
+        seg_source = str(segment.get("source", ""))
+        if seg_source in ("ocr_recovered", "ocr_only") or seg_source.startswith("ocr"):
+            print(f"[Module 4] ℹ️ Skipping TTS voice generation for OCR Hardsub Segment #{segment['id']} (Subtitle display only).")
+            segment["tts_audio_path"] = None
+            segment["tts_duration"] = 0.0
+            skip_count += 1
+            continue
+
         raw_text = segment.get("translated_text", "").strip()
         # ElevenLabs uses its own sanitizer to preserve [audio tags]
         if engine == "elevenlabs":

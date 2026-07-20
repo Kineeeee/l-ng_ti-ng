@@ -54,8 +54,8 @@ TOP_TEXT_BOLD_FONT_PATH = os.getenv("TOP_TEXT_BOLD_FONT_PATH", "")
 
 # Audio mixing and synchronization settings
 MIX_ORIGINAL_AUDIO = os.getenv("MIX_ORIGINAL_AUDIO", "True").lower() == "true"
-DUCK_VOLUME_DB = float(os.getenv("DUCK_VOLUME_DB", "-18.0"))
-ORIGINAL_VOLUME_DB = float(os.getenv("ORIGINAL_VOLUME_DB", "0.0"))
+DUCK_VOLUME_DB = float(os.getenv("DUCK_VOLUME_DB", "-24.0"))
+ORIGINAL_VOLUME_DB = float(os.getenv("ORIGINAL_VOLUME_DB", "-3.0"))
 TTS_VOLUME_DB = float(os.getenv("TTS_VOLUME_DB", "2.0"))
 AUDIO_SYNC_OFFSET_MS = float(os.getenv("AUDIO_SYNC_OFFSET_MS", "0.0"))
 
@@ -73,7 +73,7 @@ SUBTITLE_MIN_SEGMENT_DURATION = float(os.getenv("SUBTITLE_MIN_SEGMENT_DURATION",
 # OCR Subtitle settings
 ENABLE_OCR_SUBTITLE = os.getenv("ENABLE_OCR_SUBTITLE", "True").lower() == "true"
 OCR_CROP_BOTTOM_RATIO = float(os.getenv("OCR_CROP_BOTTOM_RATIO", "0.25"))
-OCR_SAMPLE_FPS = float(os.getenv("OCR_SAMPLE_FPS", "3.0"))
+OCR_SAMPLE_FPS = float(os.getenv("OCR_SAMPLE_FPS", "1.0"))
 OCR_MIN_CONFIDENCE = float(os.getenv("OCR_MIN_CONFIDENCE", "0.5"))
 
 # Download & Video Speed settings
