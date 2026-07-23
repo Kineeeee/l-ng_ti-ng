@@ -59,8 +59,9 @@ def _resolve_device() -> str:
 
 def _get_effective_speech_bounds(words: list, default_start: float, default_end: float, max_gap_sec: float = 1.5) -> tuple:
     """
-    Finds the effective start and end times of the main speech in a segment,
-    ignoring isolated words separated by large gaps of silence.
+    Finds the effective start and end times of the main speech in a segment.
+    Returns the exact bounds from the first word to the last word to preserve tight sync,
+    without artificially dropping words if there is a gap.
     """
     if not words:
         return default_start, default_end
@@ -74,35 +75,6 @@ def _get_effective_speech_bounds(words: list, default_start: float, default_end:
 
     if not word_list:
         return default_start, default_end
-
-    num_words = len(word_list)
-    large_gap_idx = -1
-    max_gap = 0.0
-
-    for i in range(num_words - 1):
-        gap = word_list[i + 1]["start"] - word_list[i]["end"]
-        if gap > max_gap:
-            max_gap = gap
-            large_gap_idx = i
-
-    if max_gap > max_gap_sec and large_gap_idx != -1:
-        text_before = "".join([w["text"] for w in word_list[: large_gap_idx + 1]])
-        text_after  = "".join([w["text"] for w in word_list[large_gap_idx + 1 :]])
-
-        if len(text_after) >= len(text_before):
-            print(
-                f"           [Sync Adjust] Segment '{word_list[0]['text'][:5]}...' "
-                f"has large gap of {max_gap:.2f}s. "
-                f"Shifting start: {default_start:.2f}s -> {word_list[large_gap_idx + 1]['start']:.2f}s"
-            )
-            return word_list[large_gap_idx + 1]["start"], word_list[-1]["end"]
-        else:
-            print(
-                f"           [Sync Adjust] Segment '{word_list[0]['text'][:5]}...' "
-                f"has large gap of {max_gap:.2f}s. "
-                f"Shifting end: {default_end:.2f}s -> {word_list[large_gap_idx]['end']:.2f}s"
-            )
-            return word_list[0]["start"], word_list[large_gap_idx]["end"]
 
     return word_list[0]["start"], word_list[-1]["end"]
 
@@ -125,8 +97,8 @@ _MLX_MODEL_MAP = {
 
 def _detect_speech_intervals(
     audio_path: str,
-    top_db: float = 35.0,
-    speech_pad_ms: int = 200,
+    top_db: float = 45.0,
+    speech_pad_ms: int = 300,
     merge_gap_sec: float = 1.5,
 ):
     """
@@ -253,7 +225,7 @@ def _transcribe_with_mlx(audio_path: str, language_hint: str = None) -> list:
                 chunk_path = os.path.join(tmp_dir, f"chunk_{idx:03d}.wav")
                 subprocess.run(
                     [
-                        "ffmpeg", "-y",
+                        "ffmpeg", "-y", "-nostdin",
                         "-ss", str(start_sec),
                         "-t",  str(end_sec - start_sec),
                         "-i",  audio_path,
@@ -353,7 +325,7 @@ def _transcribe_with_cpu(audio_path: str, language_hint: str = None) -> list:
         vad_filter=True,
         vad_parameters=dict(
             min_silence_duration_ms=300,
-            speech_pad_ms=200,
+            speech_pad_ms=400,
         ),
         condition_on_previous_text=True,
     )
@@ -411,7 +383,7 @@ def _split_audio_for_groq(audio_path: str, job_tmp_dir: str) -> list:
         start      = i * _GROQ_CHUNK_DURATION_SEC
         chunk_path = os.path.join(job_tmp_dir, f"groq_chunk_{i:03d}.mp3")
         subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(start), "-t", str(_GROQ_CHUNK_DURATION_SEC),
+            ["ffmpeg", "-y", "-nostdin", "-ss", str(start), "-t", str(_GROQ_CHUNK_DURATION_SEC),
              "-i", audio_path, "-ar", "16000", "-ac", "1", "-b:a", "64k", chunk_path],
             capture_output=True,
         )
@@ -569,18 +541,28 @@ def transcribe_audio(audio_path: str, language_hint: str = None, device_override
     else:  # 'cpu' or unknown → safer default
         stt_segments = _transcribe_with_cpu(audio_path, language_hint)
 
-    # Perform Video OCR Subtitle Fusion if video_path is available
+    final_segments = stt_segments
     if ENABLE_OCR_SUBTITLE and video_path and os.path.exists(video_path):
         try:
             from backend.app.pipeline.ocr_subtitle import extract_subtitles_from_video, merge_stt_and_ocr_segments
             ocr_segs = extract_subtitles_from_video(video_path, stt_segments=stt_segments)
             if ocr_segs:
                 fused_segments, stats = merge_stt_and_ocr_segments(stt_segments, ocr_segs)
-                return fused_segments
+                final_segments = fused_segments
         except Exception as e:
             print(f"[Module 2] WARNING: OCR subtitle extraction/fusion failed ({e}). Continuing with STT segments.")
 
-    return stt_segments
+    for seg in final_segments:
+        if "orig_start" not in seg or seg["orig_start"] is None:
+            seg["orig_start"] = seg["start"]
+        if "orig_end" not in seg or seg["orig_end"] is None:
+            seg["orig_end"] = seg["end"]
+        if "start_ms" not in seg or seg["start_ms"] is None:
+            seg["start_ms"] = int(seg["start"] * 1000)
+        if "end_ms" not in seg or seg["end_ms"] is None:
+            seg["end_ms"] = int(seg["end"] * 1000)
+
+    return final_segments
 
 
 if __name__ == "__main__":

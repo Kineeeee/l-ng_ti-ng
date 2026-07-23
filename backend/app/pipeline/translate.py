@@ -419,6 +419,9 @@ def translate_segments(
     if not translation_style:
         translation_style = TRANSLATION_STYLE or "standard"
 
+    if not source_language:
+        source_language = "auto"
+        
     # If source is already Vietnamese, just copy text
     if source_language.lower() in ("vi", "vie", "vietnamese"):
         print("[Module 3] Source language is Vietnamese, skipping translation.")

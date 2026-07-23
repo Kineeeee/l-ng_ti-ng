@@ -5,6 +5,10 @@ import subprocess
 import json
 import glob
 
+# Force unbuffered stdout/stderr so prompts always appear before input() blocks
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 # Ensure backend folder is in path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -227,14 +231,14 @@ def start_new_job(initial_url: str = None):
         summarize = input("Tạo Bản tóm tắt & Gợi ý tiêu đề? (y/n) [mặc định: y]: ").strip().lower()
         summarize_flag = "" if summarize != 'n' else "--skip-summarize"
     else:
-        # Quick Auto Mode - Best Defaults
+        # Quick Auto Mode - Best Defaults (fully automated, no interactive pauses)
         print("  → ⚡ Đã chọn Chế độ 1-Click Quick Auto! Đang tự động thiết lập thông số chuẩn...")
         lang = "auto"
         transcribe_device = WHISPER_DEVICE
         trans_style = TRANSLATION_STYLE
         pitch = PITCH_METHOD
         tts_engine = ""
-        interactive_flag = "-i"
+        interactive_flag = ""  # No -i flag: 1-Click runs fully automated without pausing
         no_ocr_flag = ""
         manual_trans_flag = ""
         subs_flag = ""
@@ -243,6 +247,7 @@ def start_new_job(initial_url: str = None):
     # Construct CLI command
     cmd = [
         get_python_executable(),
+        "-u",  # Force unbuffered stdout/stderr in subprocess
         os.path.join(os.path.dirname(__file__), "cli_pipeline.py"),
         url,
         "--lang", lang,
@@ -330,21 +335,22 @@ def list_and_resume_jobs():
             print(f"  Status : {selected_job['status']}")
             print("="*55)
             print("  1. ⚡ Tiếp tục tự động từ bước chưa hoàn thành [Enter]")
-            print("  2. 🎯 Ép chạy lại từ một bước cụ thể...")
-            print("  3. 🗑️ Xóa toàn bộ Job này (Folder & Checkpoints)")
+            print("  2. 🎛️ Tiếp tục + Bật xem & duyệt checkpoint (--interactive)")
+            print("  3. 🎯 Ép chạy lại từ một bước cụ thể...")
+            print("  4. 🗑️ Xóa toàn bộ Job này (Folder & Checkpoints)")
             if has_summary:
-                print("  4. 📄 Xem Bản Tóm Tắt & Gợi Ý Tiêu Đề (summary.txt)")
-                print("  5. ⬅️ Quay lại")
+                print("  5. 📄 Xem Bản Tóm Tắt & Gợi Ý Tiêu Đề (summary.txt)")
+                print("  6. ⬅️ Quay lại")
             else:
-                print("  4. ⬅️ Quay lại")
+                print("  5. ⬅️ Quay lại")
             print("="*55)
             
             action = input("Chọn thao tác [mặc định: 1]: ").strip() or "1"
             
-            if (has_summary and action == '5') or (not has_summary and action == '4'):
+            if (has_summary and action == '6') or (not has_summary and action == '5'):
                 break
             
-            if has_summary and action == '4':
+            if has_summary and action == '5':
                 try:
                     with open(summary_path, "r", encoding="utf-8") as f:
                         print("\n" + f.read())
@@ -355,13 +361,16 @@ def list_and_resume_jobs():
                 
             cmd = [
                 get_python_executable(),
+                "-u",  # Force unbuffered stdout/stderr in subprocess
                 os.path.join(os.path.dirname(__file__), "cli_pipeline.py"),
                 "--resume", job_id
             ]
 
             if action == '1':
-                cmd.append("-i")
+                pass  # Fully automated — no -i flag
             elif action == '2':
+                cmd.append("-i")  # User explicitly wants interactive checkpoint review
+            elif action == '3':
                 print("\nCác bước trong Pipeline:")
                 for step in STEPS:
                     print(f"  - {step}")
@@ -369,12 +378,16 @@ def list_and_resume_jobs():
                 if resume_step not in STEPS:
                     print("❌ Tên bước không hợp lệ.")
                     continue
-                cmd.extend(["--resume-from", resume_step, "-i"])
+                cmd.extend(["--resume-from", resume_step])
+                
+                use_interactive = input("Bật xem & duyệt checkpoint? (y/n) [mặc định: n]: ").strip().lower()
+                if use_interactive == 'y':
+                    cmd.append("-i")
                 
                 use_cache = input(f"Dùng lại dữ liệu cũ của '{resume_step}'? (y/n) [mặc định: y]: ").strip().lower()
                 if use_cache == 'n':
                     cmd.append("--clear-cache")
-            elif action == '3':
+            elif action == '4':
                 confirm = input(f"⚠️ Bạn có chắc chắn muốn XÓA Job {job_id}? (y/n): ").strip().lower()
                 if confirm == 'y':
                     job_dir = os.path.join("output", job_id)

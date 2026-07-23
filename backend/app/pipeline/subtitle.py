@@ -29,18 +29,24 @@ _SEMANTIC_SPLIT_PATTERNS = [
 
 
 def format_time_srt(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int(round((seconds - int(seconds)) * 1000))
+    seconds = max(0.0, float(seconds))
+    total_ms = int(round(seconds * 1000.0))
+    ms = total_ms % 1000
+    total_s = total_ms // 1000
+    s = total_s % 60
+    m = (total_s // 60) % 60
+    h = total_s // 3600
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
 def format_time_ass(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    cs = int(round((seconds - int(seconds)) * 100))  # centiseconds
+    seconds = max(0.0, float(seconds))
+    total_cs = int(round(seconds * 100.0))
+    cs = total_cs % 100
+    total_s = total_cs // 100
+    s = total_s % 60
+    m = (total_s // 60) % 60
+    h = total_s // 3600
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
@@ -232,8 +238,8 @@ def generate_subtitles(
         # Lọc bỏ audio tags (ví dụ: [happy], [laughs])
         text = re.sub(r'\[.*?\]\s*', '', text).strip()
         
-        start = seg["start"]
-        end = seg["end"]
+        start = seg.get("new_start", seg["start"])
+        end = seg.get("new_end", seg["end"])
 
         sub_segs = split_long_subtitle(text, start, end)
         expanded.extend(sub_segs)

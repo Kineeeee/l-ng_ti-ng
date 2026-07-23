@@ -167,6 +167,7 @@ def _run_ffmpeg_with_progress(cmd: list, total_duration: float, label: str = "Re
     """Run FFmpeg command and display real-time progress."""
     process = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         universal_newlines=True

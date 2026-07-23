@@ -90,7 +90,7 @@ def get_text_pixel_mask(crop_bgr):
     return ratio, thresh
 
 
-def compute_stt_time_gaps(stt_segments: list, total_duration: float, min_gap_sec: float = 0.8) -> list:
+def compute_stt_time_gaps(stt_segments: list, total_duration: float, min_gap_sec: float = 0.4) -> list:
     """
     Computes time gaps (start, end) where Whisper STT detected NO speech.
     Returns list of (gap_start, gap_end) tuples.
@@ -99,11 +99,16 @@ def compute_stt_time_gaps(stt_segments: list, total_duration: float, min_gap_sec
         return [(0.0, total_duration)] if total_duration >= min_gap_sec else []
 
     gaps = []
-    sorted_segs = sorted(stt_segments, key=lambda x: x["start"])
+    # Filter valid non-empty STT segments
+    valid_segs = [s for s in stt_segments if s.get("text") and (s.get("end", 0) > s.get("start", 0))]
+    if not valid_segs:
+        return [(0.0, total_duration)] if total_duration >= min_gap_sec else []
+
+    sorted_segs = sorted(valid_segs, key=lambda x: x["start"])
 
     # Gap before first STT segment
     if sorted_segs[0]["start"] >= min_gap_sec:
-        gaps.append((0.0, max(0.0, sorted_segs[0]["start"] - 0.2)))
+        gaps.append((0.0, round(sorted_segs[0]["start"], 3)))
 
     # Gaps between consecutive STT segments
     for i in range(len(sorted_segs) - 1):
@@ -111,11 +116,11 @@ def compute_stt_time_gaps(stt_segments: list, total_duration: float, min_gap_sec
         next_start = sorted_segs[i + 1]["start"]
         gap_dur = next_start - prev_end
         if gap_dur >= min_gap_sec:
-            gaps.append((round(prev_end + 0.2, 3), round(next_start - 0.2, 3)))
+            gaps.append((round(prev_end, 3), round(next_start, 3)))
 
     # Gap after last STT segment
     if total_duration - sorted_segs[-1]["end"] >= min_gap_sec:
-        gaps.append((round(sorted_segs[-1]["end"] + 0.2, 3), round(total_duration, 3)))
+        gaps.append((round(sorted_segs[-1]["end"], 3), round(total_duration, 3)))
 
     return gaps
 
@@ -166,11 +171,10 @@ def detect_subtitle_region(
     detect_fps = n_samples / max(1.0, duration)
     vf_detect  = (
         f"fps={detect_fps:.5f},"
-        f"crop=iw:{crop_h_orig}:0:{y_search_start},"
-        f"scale=720:-1"
+        f"crop=iw:{crop_h_orig}:0:{y_search_start}"
     )
     ffmpeg_cmd = [
-        "ffmpeg", "-y", "-threads", "0",
+        "ffmpeg", "-y", "-nostdin", "-threads", "0",
         "-i", video_path,
         "-vf", vf_detect,
         "-frames:v", str(n_samples),
@@ -182,9 +186,9 @@ def detect_subtitle_region(
 
     detect_frames = sorted(glob.glob(os.path.join(detect_tmp, "d_*.jpg")))
 
-    # scale factor to map bbox coords from 720px-wide space back to original-width space
-    # (uniform scale: x_orig = x_720 * width/720,  y_full = y_search_start + y_crop * width/720)
-    scale_to_orig = width / 720.0
+    # scale factor to map bbox coords from frame space back to original-width space
+    # (Since we removed scaling, scale_to_orig is 1.0)
+    scale_to_orig = 1.0
 
     votes          = np.zeros(height, dtype=np.int32)
     frames_with_votes = 0
@@ -222,14 +226,14 @@ def detect_subtitle_region(
                     continue
 
                 try:
-                    # Map bbox from 720px-crop space → full-frame pixel space
+                    # Map bbox from unscaled crop space → full-frame pixel space
                     y_coords = [pt[1] for pt in bbox]
                     y_top = int(y_search_start + min(y_coords) * scale_to_orig)
                     y_bot = int(y_search_start + max(y_coords) * scale_to_orig)
 
-                    # Horizontal centering: x/720 = x_orig/video_width (uniform scale)
+                    # Horizontal centering: x / width
                     x_coords = [pt[0] for pt in bbox]
-                    x_center_norm = (min(x_coords) + max(x_coords)) / 2.0 / 720.0
+                    x_center_norm = (min(x_coords) + max(x_coords)) / 2.0 / float(width)
                     if x_center_norm < 0.1 or x_center_norm > 0.9:
                         continue
 
@@ -260,7 +264,7 @@ def detect_subtitle_region(
 
     # ── Find contiguous band around vote peak ─────────────────────────────────
     peak_y    = int(np.argmax(votes))
-    threshold = max(2, int(max_votes * 0.35))
+    threshold = max(1, int(max_votes * 0.15))
 
     top = peak_y
     while top > 0 and votes[top - 1] >= threshold:
@@ -271,13 +275,13 @@ def detect_subtitle_region(
         bottom += 1
 
     detected_h = bottom - top
-    if detected_h < int(height * 0.01) or detected_h > int(height * 0.20):
+    if detected_h < int(height * 0.01) or detected_h > int(height * 0.25):
         print(f"[OCR Region] ⚠️ Detected band ({detected_h}px) unrealistic. "
               "Using fallback crop ratio.")
         return None, None
 
-    # Generous padding so OCR doesn't clip text edges
-    padding = max(12, int(height * 0.015))
+    # Generous padding so OCR doesn't clip multi-line text edges
+    padding = max(24, int(height * 0.03))
     y_start = max(0, top - padding)
     y_end   = min(height, bottom + padding)
 
@@ -369,8 +373,9 @@ def extract_subtitles_from_video(
         time_gaps = [(0.0, duration)]
         print(f"[Module 2-OCR] 🔍 Scanning entire video with RapidOCR (sample_fps={sample_fps}, crop_y=[{crop_y_start}–{crop_y_end}]px)...")
 
-    # ── OCR_TARGET_WIDTH: resolution at which ONNX runs (720px wide, pre-cropped by FFmpeg)
-    OCR_TARGET_WIDTH = 720
+    # ── OCR_TARGET_WIDTH: resolution at which ONNX runs (1280px wide, pre-cropped by FFmpeg)
+    # Using 1280 (full HD width) prevents small text from being unreadable after downscaling.
+    OCR_TARGET_WIDTH = 1280
     crop_height = crop_y_end - crop_y_start   # tight band in pixels
 
     # scale_to_norm: ratio to convert bbox x coords (in 720px space) to [0-1] of video width
@@ -411,7 +416,7 @@ def extract_subtitles_from_video(
             f"scale={OCR_TARGET_WIDTH}:-1"
         )
         cmd = [
-            "ffmpeg", "-y", "-threads", "2",  # limit threads per process (parallel runs)
+            "ffmpeg", "-y", "-nostdin", "-threads", "2",  # limit threads per process (parallel runs)
             "-ss", f"{g_start:.3f}",
             "-t",  f"{g_duration:.3f}",
             "-i",  video_path,
@@ -618,15 +623,15 @@ def merge_stt_and_ocr_segments(stt_segments: list, ocr_segments: list) -> tuple:
         # Calculate total overlap duration with ALL STT speech segments
         total_overlap_duration = 0.0
         for stt_seg in stt_segments:
-            s_start = max(0.0, stt_seg["start"] - 0.3)
-            s_end = stt_seg["end"] + 0.3
+            s_start = stt_seg["start"]
+            s_end = stt_seg["end"]
 
             overlap = max(0.0, min(o_end, s_end) - max(o_start, s_start))
             total_overlap_duration += overlap
 
         overlap_ratio = total_overlap_duration / o_duration
 
-        if overlap_ratio > 0.15 or total_overlap_duration >= 0.25:
+        if overlap_ratio > 0.45:
             continue
 
         recovered_count += 1

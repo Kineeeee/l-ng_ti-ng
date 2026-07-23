@@ -173,7 +173,7 @@ def _pitch_shift_clean(input_wav: str, output_wav: str, n_steps: float) -> bool:
 
     # 1. FFmpeg rubberband filter (Thuật toán chuyên nghiệp — Giữ nguyên formant, không bị vang)
     cmd_rubberband = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
         "-i", input_wav,
         "-af", f"rubberband=pitch={pitch_ratio:.6f}:pitchq=quality:formant=preserved",
         output_wav
@@ -198,7 +198,7 @@ def _pitch_shift_clean(input_wav: str, output_wav: str, n_steps: float) -> bool:
         target_rate = int(sr * pitch_ratio)
         af_filter = f"asetrate={target_rate},aresample={sr},atempo={tempo_ratio:.6f}"
         cmd_resample = [
-            "ffmpeg", "-y", "-loglevel", "error",
+            "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
             "-i", input_wav,
             "-af", af_filter,
             output_wav
@@ -210,6 +210,94 @@ def _pitch_shift_clean(input_wav: str, output_wav: str, n_steps: float) -> bool:
         pass
 
     # 3. Fallback: Librosa
+    librosa = _import_librosa()
+    y, sr = _load_mono_float32(input_wav, sr=ANALYSIS_SR)
+    y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
+    _save_float32_to_wav(y_shifted, sr, output_wav)
+    return True
+
+
+def _pitch_shift_hoat_ngon(input_wav: str, output_wav: str, n_steps: float) -> bool:
+    """
+    Pitch shift chuyên dụng cho giọng hoạt ngôn — tối ưu độ trong trẻo.
+
+    Khác với _pitch_shift_clean:
+    - pitchq=quality + transients=crisp + window=short: giữ rõ consonant,
+      ít smearing hơn, sắc nét cho giọng nói nhanh
+    - formant=shifted (mặc định, KHÔNG preserve) → formant tăng cùng pitch,
+      tạo cảm giác giọng trẻ trung, tươi tắn tự nhiên (giống CapCut Hoạt Ngôn)
+    - Thêm chuỗi EQ sau pitch shift để tăng độ trong trẻo:
+        • highpass=80Hz  → loại bỏ tiếng ầm ì / rumble thấp
+        • equalizer 300Hz -2dB (width_type=o, width=1.0) → giảm muddy
+        • equalizer 3000Hz +3dB (width_type=o, width=1.5) → tăng presence/clarity
+        • equalizer 8000Hz +2dB (width_type=o, width=2.0) → thêm air/sparkle
+
+    Thứ tự ưu tiên:
+    1. FFmpeg rubberband (quality + crisp transients + short window) + EQ
+    2. Resampling + EQ (fallback)
+    3. Librosa (fallback cuối)
+    """
+    if abs(n_steps) < 0.1:
+        import shutil
+        if input_wav != output_wav:
+            shutil.copy2(input_wav, output_wav)
+        return True
+
+    pitch_ratio = 2.0 ** (n_steps / 12.0)
+
+    # EQ chuỗi để tăng độ trong trẻo sau khi pitch shift
+    # highpass cắt rumble, giảm muddy 300Hz, boost presence 3kHz, boost air 8kHz
+    eq_chain = (
+        "highpass=f=80,"
+        "equalizer=f=300:width_type=o:width=1.0:g=-2,"
+        "equalizer=f=3000:width_type=o:width=1.5:g=3,"
+        "equalizer=f=8000:width_type=o:width=2.0:g=2"
+    )
+
+    # 1. Rubberband quality + EQ
+    # - pitchq=quality: chất lượng cao nhất
+    # - transients=crisp: giữ rõ consonant (s, t, ch...) — rất quan trọng cho giọng trong
+    # - formant=shifted (mặc định): formant tăng theo pitch → giọng trẻ tự nhiên như CapCut
+    # - window=short: cửa sổ ngắn → ít smearing hơn cho giọng nói nhanh
+    af_rubberband_eq = f"rubberband=pitch={pitch_ratio:.6f}:pitchq=quality:transients=crisp:window=short,{eq_chain}"
+    cmd_rubberband = [
+        "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+        "-i", input_wav,
+        "-af", af_rubberband_eq,
+        output_wav
+    ]
+    try:
+        res = subprocess.run(cmd_rubberband, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 100:
+            return True
+    except Exception:
+        pass
+
+    # 2. Resampling + EQ fallback
+    try:
+        tempo_ratio = 1.0 / pitch_ratio
+        sr = 24000
+        try:
+            with wave.open(input_wav, "rb") as wf:
+                sr = wf.getframerate()
+        except Exception:
+            pass
+
+        target_rate = int(sr * pitch_ratio)
+        af_resample_eq = f"asetrate={target_rate},aresample={sr},atempo={tempo_ratio:.6f},{eq_chain}"
+        cmd_resample = [
+            "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+            "-i", input_wav,
+            "-af", af_resample_eq,
+            output_wav
+        ]
+        res = subprocess.run(cmd_resample, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 100:
+            return True
+    except Exception:
+        pass
+
+    # 3. Fallback: Librosa (không EQ — vẫn tốt hơn không shift)
     librosa = _import_librosa()
     y, sr = _load_mono_float32(input_wav, sr=ANALYSIS_SR)
     y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
@@ -475,12 +563,17 @@ def apply_hoat_ngon_pitch_shift(
     """
     Phương án 3: Biến đổi giọng TTS theo phong cách 'Cô gái hoạt ngôn' (CapCut style).
     Đẩy cao độ (pitch) lên ~+3.5 semitones để tạo tông giọng tươi trẻ, nhanh nhẹn và hoạt ngôn.
-    Không phụ thuộc vào file âm thanh gốc. Sử dụng FFmpeg rubberband để triệt để loại bỏ tiếng vang.
+    Không phụ thuộc vào file âm thanh gốc.
+
+    Cải thiện v2 — Tăng độ trong trẻo:
+    - Dùng rubberband pitchq=crisp (sắc nét, ít smearing hơn quality)
+    - Formant tăng tự nhiên cùng pitch (không preserve) → giọng trẻ như CapCut
+    - EQ sau pitch: loại rumble thấp, giảm muddy, boost presence 3kHz, boost air 8kHz
     """
     try:
-        ok = _pitch_shift_clean(tts_wav_path, output_path, n_steps=n_steps)
+        ok = _pitch_shift_hoat_ngon(tts_wav_path, output_path, n_steps=n_steps)
         if ok:
-            print(f"           [Hoạt-Ngôn] Shift +{n_steps:.1f} semitones → {os.path.basename(output_path)}")
+            print(f"           [Hoạt-Ngôn] Shift +{n_steps:.1f} semitones + EQ trong trẻo → {os.path.basename(output_path)}")
         return ok
     except Exception as e:
         print(f"           [Hoạt-Ngôn] ⚠ Lỗi: {e}. Dùng TTS gốc.")
@@ -624,7 +717,11 @@ def apply_pitch_to_all_segments(
         )
 
         if ok and os.path.exists(pitched_path) and os.path.getsize(pitched_path) > 100:
+            from backend.app.pipeline.audio_utils import get_wav_duration_fast
             segment["tts_audio_path"] = pitched_path
+            new_dur = get_wav_duration_fast(pitched_path)
+            segment["tts_duration"] = new_dur
+            segment["dur_ms"] = int(new_dur * 1000)
             success_count += 1
         else:
             # Giữ nguyên TTS gốc nếu thất bại

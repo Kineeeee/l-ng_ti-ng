@@ -30,8 +30,9 @@ TTS_ENGINE = os.getenv("TTS_ENGINE", "edge-tts")
 TTS_VOICE = os.getenv("TTS_VOICE", "vi-VN-HoaiMyNeural")
 TTS_CONCURRENCY = int(os.getenv("TTS_CONCURRENCY", "2"))
 TRANSLATION_BATCH_SIZE = int(os.getenv("TRANSLATION_BATCH_SIZE", "12"))
-TTS_SPEED = os.getenv("TTS_SPEED", "+0%")
+TTS_SPEED = os.getenv("TTS_SPEED", "+10%")
 TTS_DYNAMIC_SPEEDUP = os.getenv("TTS_DYNAMIC_SPEEDUP", "True").lower() == "true"
+ENABLE_VIDEO_RETIMING = os.getenv("ENABLE_VIDEO_RETIMING", "True").lower() == "true"
 
 MASK_OLD_SUBS = os.getenv("MASK_OLD_SUBS", "True").lower() == "true"
 MASK_SUB_Y_RATIO = float(os.getenv("MASK_SUB_Y_RATIO", "0.15"))
@@ -77,6 +78,6 @@ OCR_SAMPLE_FPS = float(os.getenv("OCR_SAMPLE_FPS", "1.0"))
 OCR_MIN_CONFIDENCE = float(os.getenv("OCR_MIN_CONFIDENCE", "0.5"))
 
 # Download & Video Speed settings
-VIDEO_SPEED_FACTOR = float(os.getenv("VIDEO_SPEED_FACTOR", "0.7"))
+VIDEO_SPEED_FACTOR = float(os.getenv("VIDEO_SPEED_FACTOR", "1.0"))
 
 

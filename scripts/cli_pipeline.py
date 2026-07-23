@@ -38,6 +38,7 @@ from backend.app.config import (
     TTS_VOICE,
     TTS_ENGINE,
     WHISPER_DEVICE,
+    ENABLE_VIDEO_RETIMING,
 )
 from backend.app.pipeline.download import download_video
 from backend.app.pipeline.transcribe import transcribe_audio
@@ -45,6 +46,7 @@ from backend.app.pipeline.translate import translate_segments
 from backend.app.pipeline.summarize import summarize_video_content, format_summary_text
 from backend.app.pipeline.tts import generate_tts_for_segments
 from backend.app.pipeline.pitch import apply_pitch_to_all_segments
+from backend.app.pipeline.video_retime import retime_video_and_segments
 from backend.app.pipeline.align import align_and_merge_audio
 from backend.app.pipeline.subtitle import generate_subtitles
 from backend.app.pipeline.render import render_final_video, _get_video_info
@@ -67,15 +69,25 @@ def get_job_dir(output_dir: str, job_id: str) -> str:
 def get_checkpoint_path(output_dir: str, job_id: str, step_name: str) -> str:
     return os.path.join(get_job_dir(output_dir, job_id), f"checkpoint_{step_name}.json")
 
+def _json_default(obj):
+    """Fallback serializer for non-standard JSON objects (e.g. AudioSegment)."""
+    if hasattr(obj, "__class__") and obj.__class__.__name__ == "AudioSegment":
+        return None
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
 def save_checkpoint(output_dir: str, job_id: str, step_name: str, data: dict):
     job_dir = get_job_dir(output_dir, job_id)
     os.makedirs(job_dir, exist_ok=True)
     path = get_checkpoint_path(output_dir, job_id, step_name)
     temp_path = f"{path}.tmp"
     with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
     os.replace(temp_path, path)
     print(f"[Checkpoint] Saved step '{step_name}' to {path}")
+
 
 def load_checkpoint(output_dir: str, job_id: str, step_name: str) -> dict:
     path = get_checkpoint_path(output_dir, job_id, step_name)
@@ -138,6 +150,12 @@ def initialize_resumed_state(output_dir: str, job_id: str, resume_step: str) -> 
     align_info = load_checkpoint(output_dir, job_id, "align")
     if align_info:
         state["dubbed_audio_path"] = align_info.get("dubbed_audio_path")
+        if align_info.get("video_path") and os.path.exists(align_info["video_path"]):
+            state["video_path"] = align_info["video_path"]
+        if align_info.get("audio_path") and os.path.exists(align_info["audio_path"]):
+            state["audio_path"] = align_info["audio_path"]
+        if align_info.get("duration"):
+            state["duration"] = align_info["duration"]
         
     sub_info = load_checkpoint(output_dir, job_id, "subtitle")
     if sub_info:
@@ -406,7 +424,7 @@ def main():
     parser.add_argument("--mask-top-color", default=MASK_TOP_COLOR, help="Color of the top mask (default: black)")
     
     # Audio mixing and sync arguments
-    parser.add_argument("--no-mix-audio", action="store_true", default=not MIX_ORIGINAL_AUDIO, help="Disable mixing of original background audio (output dubbed voice only)")
+    parser.add_argument("--no-mix-audio", action="store_true", help="Disable mixing of original background audio (output dubbed voice only). Overrides MIX_ORIGINAL_AUDIO in .env")
     parser.add_argument("--duck-vol", type=float, default=DUCK_VOLUME_DB, help="Volume of background audio during speech in dB (default: -18.0)")
     parser.add_argument("--original-vol", type=float, default=ORIGINAL_VOLUME_DB, help="Overall volume adjustment of original audio in dB (default: 0.0)")
     parser.add_argument("--tts-vol", type=float, default=TTS_VOLUME_DB, help="Volume boost of dubbed TTS voice in dB (default: 2.0)")
@@ -801,9 +819,24 @@ def main():
     step = "align"
     run_step = _should_run(step, start_step)
     if run_step:
-        print("\n--- [Step 5] Align Audio ---")
+        print("\n--- [Step 5] Align Audio & Video Retiming ---")
         t0 = time.time()
-        mix_original = not args.no_mix_audio
+        if ENABLE_VIDEO_RETIMING:
+            source_v_path = os.path.join(job_output_dir, f"{job_id}.mp4")
+            if not os.path.exists(source_v_path):
+                source_v_path = os.path.join(output_dir, f"{job_id}.mp4")
+            if not os.path.exists(source_v_path):
+                source_v_path = video_path
+
+            video_path, segments, retimed_audio_path, duration = retime_video_and_segments(
+                video_path=source_v_path,
+                processed_segments=segments,
+                output_dir=job_output_dir,
+                job_id=job_id
+            )
+            if retimed_audio_path and os.path.exists(retimed_audio_path):
+                audio_path = retimed_audio_path
+        mix_original = MIX_ORIGINAL_AUDIO and not args.no_mix_audio
         dubbed_audio_path = align_and_merge_audio(
             segments=segments,
             video_duration_sec=duration,
@@ -816,8 +849,15 @@ def main():
             tts_volume_db=args.tts_vol,
             sync_offset_ms=args.sync_offset
         )
+        if isinstance(segments, list):
+            for seg in segments:
+                if isinstance(seg, dict):
+                    seg.pop("audio", None)
         checkpoint_data = {
             "dubbed_audio_path": dubbed_audio_path,
+            "video_path": video_path,
+            "audio_path": audio_path,
+            "duration": duration,
             "segments": segments
         }
         save_checkpoint(output_dir, job_id, step, checkpoint_data)
